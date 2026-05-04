@@ -51,6 +51,13 @@
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 
+// start_pie needs the level-editor module + asset viewport to pin PIE to in-viewport mode
+#include "LevelEditor.h"
+#include "IAssetViewport.h"
+#include "Modules/ModuleManager.h"
+#include "Editor/UnrealEdEngine.h"
+#include "UnrealEdGlobals.h"
+
 // --- Compile state ---
 
 FMonolithLogCapture* FMonolithEditorActions::CachedLogCapture = nullptr;
@@ -371,7 +378,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		MakeShared<FJsonObject>());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("run_console_command"),
-		TEXT("Execute a console command in the active PIE world (or editor world if no PIE). Useful for triggering exec functions, toggling view modes, etc."),
+		TEXT("Execute a console command. Routes to the first PIE PlayerController found (multi-client PIE not disambiguated); falls back to GEngine->Exec when no PIE session is active."),
 		FMonolithActionHandler::CreateStatic(&HandleRunConsoleCommand),
 		FParamSchemaBuilder()
 			.Required(TEXT("command"), TEXT("string"), TEXT("Console command string (e.g. 'BowLoop 1', 'WalkLoop', 'Cam3P 1')"))
@@ -1038,6 +1045,10 @@ FMonolithActionResult FMonolithEditorActions::HandleRunConsoleCommand(const TSha
 	}
 	else
 	{
+		if (!GEngine)
+		{
+			return FMonolithActionResult::Error(TEXT("GEngine is null — run_console_command requires engine context."));
+		}
 		GEngine->Exec(TargetWorld, *Command);
 	}
 
@@ -1053,7 +1064,7 @@ FMonolithActionResult FMonolithEditorActions::HandleRunConsoleCommand(const TSha
 // ---------------------------------------------------------------------------
 FMonolithActionResult FMonolithEditorActions::HandleStartPIE(const TSharedPtr<FJsonObject>& Params)
 {
-	if (!GEditor) return FMonolithActionResult::Error(TEXT("GEditor not available"));
+	if (!GUnrealEd) return FMonolithActionResult::Error(TEXT("GUnrealEd not available"));
 
 	// Reject if a PIE session is already running so we don't queue duplicates.
 	for (const FWorldContext& Context : GEditor->GetWorldContexts())
@@ -1067,12 +1078,24 @@ FMonolithActionResult FMonolithEditorActions::HandleStartPIE(const TSharedPtr<FJ
 		}
 	}
 
+	// Pin to in-viewport mode so the action is independent of the user's
+	// last-used PIE flavour (Simulate / NewWindow / etc.).
+	FLevelEditorModule& LevelEditorModule = FModuleManager::GetModuleChecked<FLevelEditorModule>("LevelEditor");
+	TSharedPtr<IAssetViewport> ActiveLevelViewport = LevelEditorModule.GetFirstActiveViewport();
+	if (!ActiveLevelViewport.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("No active level viewport — cannot pin PIE to in-viewport mode."));
+	}
+
 	FRequestPlaySessionParams SessionParams;
-	GEditor->RequestPlaySession(SessionParams);
-	GEditor->StartQueuedPlaySessionRequest();
+	SessionParams.WorldType = EPlaySessionWorldType::PlayInEditor;
+	SessionParams.DestinationSlateViewport = ActiveLevelViewport;
+	GUnrealEd->RequestPlaySession(SessionParams);
+	GUnrealEd->StartQueuedPlaySessionRequest();
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("started"), true);
+	Root->SetStringField(TEXT("mode"), TEXT("in_viewport"));
 	return FMonolithActionResult::Success(Root);
 }
 
