@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.14.7 (Beta)
+**Version:** 0.14.10 (Beta)
 
 ---
 
@@ -14,12 +14,14 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, registers 22 actions (20 base + 2 from `FMonolithEditorMapActions` Phase J F8) |
+| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, registers 29 actions (20 base + 2 Phase J F8 map actions + 2 v0.14.8 PR #48 automation + 2 v0.14.9 Issue #50 scripting + 3 v0.14.10 PR #54 PIE/console) |
 | `FMonolithLogCapture` | FOutputDevice subclass. Ring buffer (10,000 entries max). Thread-safe. Tracks counts by verbosity |
 | `FMonolithEditorActions` | Static handlers for build and log operations. Hooks into `ILiveCodingModule::GetOnPatchCompleteDelegate()` to capture compile results and timestamps |
 | `FMonolithSettingsCustomization` | IDetailCustomization for UMonolithSettings. Adds re-index buttons for project and source databases in Project Settings UI |
 
-### Actions (22 — namespace: "editor")
+### Actions (29 — namespace: "editor")
+
+**Base (22 — v0.14.7 baseline + Phase J F8)**
 
 | Action | Description |
 |--------|-------------|
@@ -44,5 +46,33 @@
 | `get_viewport_info` | Get active editor viewport camera location, rotation, FOV, resolution, realtime state |
 | `create_empty_map` | **Phase J F8.** Create a fully blank UWorld asset at `path` and save the package. v1 supports `map_template="blank"` only. Errors cleanly on path collision, malformed package path, factory/save failure |
 | `get_module_status` | **Phase J F8.** Report `{ module_name, plugin_name, enabled, loaded, is_runtime, version? }` for the named modules (or all Monolith modules if `module_names` is omitted). Unknown modules return `enabled=false / loaded=false / plugin_name=""` without error |
+
+**Capture (1 additional from v0.14.7+)**
+
+| Action | Description |
+|--------|-------------|
+| `capture_system_gif` | Capture a Niagara system as a sequence of PNG frames with optional GIF encoding via ffmpeg or Python. Params: `asset_path`, `duration_seconds`, `fps`, `resolution`, `output_path`, `encoder` (frames_only/ffmpeg/python). |
+
+**Automation (2 — v0.14.8, PR #48 by @MaxenceEpitech)**
+
+| Action | Description |
+|--------|-------------|
+| `list_automation_tests` | List all registered automation tests, optionally filtered by `prefix`. |
+| `run_automation_tests` | Run automation tests by `prefix` in the running editor (no PIE, no separate process). Returns `{ success, total, passed, failed, skipped, results[] }`. Latent / async tests reported as `skipped`. |
+
+**Scripting (2 — v0.14.9, Issue #50 ported from @JCSopko)**
+
+| Action | Description |
+|--------|-------------|
+| `run_python` | Execute Python via `IPythonScriptPlugin::ExecPythonCommandEx`. Modes: `execute_file`, `execute_statement`, `evaluate_statement`. Returns success, captured Python log output (typed: info/warning/error), and evaluated result for `evaluate_statement`. |
+| `load_level` | Wraps `ULevelEditorSubsystem::LoadLevel(AssetPath)`. Single-arg map swap; closes current persistent level without saving. |
+
+**PIE Control (3 — v0.14.10, PR #54 by @MaxenceEpitech)**
+
+| Action | Description |
+|--------|-------------|
+| `start_pie` | Begin a PIE session pinned to in-viewport mode (`EPlaySessionWorldType::PlayInEditor` + first active level viewport via `FLevelEditorModule::GetFirstActiveViewport`). Independent of the user's `LastExecutedPlayModeType` toolbar choice. Returns `started: true, mode: 'in_viewport'`. Refuses to queue duplicates when PIE is already running. |
+| `stop_pie` | End the active PIE session via `GUnrealEd->RequestEndPlayMap()`. No-op (returns `stopped: false`) if PIE not active. |
+| `run_console_command` | Execute a console command. Routes to the first PIE PlayerController found (multi-client PIE not disambiguated); falls back to `GEngine->Exec` (with null-guard) when no PIE session is active. |
 
 ---

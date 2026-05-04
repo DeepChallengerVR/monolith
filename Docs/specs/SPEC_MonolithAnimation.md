@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.14.7 (Beta)
+**Version:** 0.14.10 (Beta)
 
 ---
 
@@ -14,30 +14,32 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 118 animation actions across `MonolithAnimationActions.cpp` (96), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1) |
+| `FMonolithAnimationModule` | Registers 120 animation actions across `MonolithAnimationActions.cpp` (98), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1) |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups (the original action handlers) |
 | `FMonolithAbpWriteActions` | ABP graph write actions (Phase v0.14.3 PR #34): `add_anim_graph_node` (TwoBoneIK / ModifyBone / LocalToComponentSpace / ComponentToLocalSpace + auto-pin exposure), `connect_anim_graph_pins`, `set_state_animation`, `add_variable_get`, `set_anim_graph_node_property` |
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
 | `FMonolithAnimLayoutActions` | `auto_layout` for AnimBP graphs |
 
-### Actions (118 — namespace: "animation")
+### Actions (120 — namespace: "animation")
 
-**Note (2026-04-26 audit):** The detailed per-category tables below cover the 96 baseline actions. The remaining **22 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module.
+**Note (2026-04-26 audit):** The detailed per-category tables below cover the 98 baseline actions. The remaining **22 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path.
 
-**Sequence Info (4) — read-only**
+**Sequence Info (5) — read-only**
 | Action | Description |
 |--------|-------------|
 | `get_sequence_info` | Get sequence metadata (duration, frames, root motion, compression, etc.) |
 | `get_sequence_notifies` | Get all notifies on an animation asset (sequence, montage, composite) |
-| `get_bone_track_keys` | Get position/rotation/scale keys for a bone track (with optional frame range) |
+| `get_bone_track_keys` | Get position/rotation/scale keys for a bone track (with optional frame range) (rewritten v0.14.10 to use non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms`; emits scales unconditionally — see CHANGELOG behaviour note) |
 | `get_sequence_curves` | Get float and transform curves on an animation sequence |
+| `list_bone_tracks` | List all bone tracks present on an animation sequence (returns `count` + `bone_names: [..]`). Discovery action for `get_bone_track_keys`. (PR #54, v0.14.10) |
 
-**Bone Track Editing (3)**
+**Bone Track Editing (4)**
 | Action | Description |
 |--------|-------------|
 | `set_bone_track_keys` | Set position/rotation/scale keys (JSON arrays) |
 | `add_bone_track` | Add a bone track to an animation sequence |
 | `remove_bone_track` | Remove a bone track (with optional `include_children`) |
+| `copy_bone_pose_between_sequences` | Read evaluated pose from source `UAnimSequence` at a time and write as keys to a destination sequence for a list of bones. Per-bone skip with structured `reason`. (PR #51 v0.14.9 by @MaxenceEpitech) |
 
 **Notify Operations (6)**
 | Action | Description |
