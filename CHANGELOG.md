@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`animation.add_anim_graph_node` now supports arbitrary concrete custom AnimGraph node classes** via an optional `node_class` parameter, while preserving the existing built-in `node_type` aliases. The action resolves loaded `UAnimGraphNode_Base` subclasses by full path or unique short/class name, rejects abstract/non-AnimGraph/ambiguous/schema-incompatible classes before mutation, and keeps stock node aliases available for release builds.
+
 ## [0.14.10] - 2026-05-09
 
 ### Added
