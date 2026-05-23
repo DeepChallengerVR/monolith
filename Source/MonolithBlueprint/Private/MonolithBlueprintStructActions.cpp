@@ -311,10 +311,16 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateUserDefinedEn
 		return FMonolithActionResult::Error(FString::Printf(TEXT("FEnumEditorUtils::CreateUserDefinedEnum failed for: %s"), *AssetName));
 	}
 
-	// CreateUserDefinedEnum creates one default entry plus the hidden _MAX.
-	// We need to add (N - 1) more enumerators for N total values.
+	// FEnumEditorUtils::CreateUserDefinedEnum seeds the enum via SetEnums(EmptyNames),
+	// which leaves ZERO user enumerators plus the auto-appended _MAX sentinel
+	// (NumEnums() == 1, index 0 == _MAX). It does NOT create a default user entry.
+	// AddNewEnumeratorForUserDefinedEnum appends exactly ONE real enumerator each call
+	// (it copies the existing entries without _MAX, adds one, then re-appends _MAX).
+	// So for N requested values we must Add exactly N times — the previous loop ran
+	// (N-1) times, authoring only N-1 real enumerators and leaving the last requested
+	// value's SetEnumeratorDisplayName to land on the _MAX sentinel slot (orphaned).
 	int32 NumValues = ValuesArray->Num();
-	for (int32 i = 1; i < NumValues; i++)
+	for (int32 i = 0; i < NumValues; i++)
 	{
 		FEnumEditorUtils::AddNewEnumeratorForUserDefinedEnum(Enum);
 	}
