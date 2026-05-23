@@ -201,6 +201,58 @@ namespace MonolithBulkFillActionsInternal
 		Out->SetNumberField(TEXT("count"), Targets.Num());
 		return FMonolithActionResult::Success(Out);
 	}
+
+	// --- describe::action_schema (gap #5) ---
+	// Surfaces a registered ACTION's param schema (names / types / required / defaults /
+	// aliases / descriptions) so callers stop trial-and-erroring param names. The data already
+	// lives in FMonolithActionInfo.ParamSchema (the same object discover serializes as "params");
+	// this just reads it back by (namespace, action). Closes the cause behind gaps #4/#12/#13.
+	static TSharedPtr<FJsonObject> BuildDescribeActionSchemaSchema()
+	{
+		return FParamSchemaBuilder()
+			.Required(TEXT("target_namespace"), TEXT("string"), TEXT("Namespace that owns the action (e.g. \"blueprint\", \"ui\")"))
+			.Required(TEXT("action"), TEXT("string"), TEXT("Action name whose param schema to return (e.g. \"add_nodes_bulk\")"))
+			.Build();
+	}
+
+	static FMonolithActionResult HandleDescribeActionSchema(const TSharedPtr<FJsonObject>& Params)
+	{
+		FString TargetNamespace;
+		if (!Params->TryGetStringField(TEXT("target_namespace"), TargetNamespace) || TargetNamespace.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("missing required parameter: target_namespace"));
+		}
+		FString ActionName;
+		if (!Params->TryGetStringField(TEXT("action"), ActionName) || ActionName.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("missing required parameter: action"));
+		}
+
+		FMonolithToolRegistry& Reg = FMonolithToolRegistry::Get();
+		const TArray<FMonolithActionInfo> Actions = Reg.GetActions(TargetNamespace);
+		const FMonolithActionInfo* Found = Actions.FindByPredicate(
+			[&ActionName](const FMonolithActionInfo& Info){ return Info.Action == ActionName; });
+
+		if (!Found)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("action '%s' not found in namespace '%s'. Use monolith_discover(\"%s\") to list available actions."),
+				*ActionName, *TargetNamespace, *TargetNamespace));
+		}
+
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetStringField(TEXT("namespace"), Found->Namespace);
+		Out->SetStringField(TEXT("action"), Found->Action);
+		Out->SetStringField(TEXT("description"), Found->Description);
+		if (!Found->Category.IsEmpty())
+		{
+			Out->SetStringField(TEXT("category"), Found->Category);
+		}
+		// Same JSON-Schema "properties" object discover serializes as "params".
+		Out->SetObjectField(TEXT("params"),
+			Found->ParamSchema.IsValid() ? Found->ParamSchema : MakeShared<FJsonObject>());
+		return FMonolithActionResult::Success(Out);
+	}
 } // namespace MonolithBulkFillActionsInternal
 
 void FMonolithBulkFillActions::RegisterAll()
@@ -241,7 +293,14 @@ void FMonolithBulkFillActions::RegisterAll()
 		FMonolithActionHandler::CreateStatic(&HandleDescribeListTargets),
 		BuildDescribeListTargetsSchema());
 
-	UE_LOG(LogMonolith, Log, TEXT("MonolithBulkFillActions: registered 2 namespaces (bulk_fill + describe) with 4 actions total"));
+	Reg.RegisterAction(
+		TEXT("describe"),
+		TEXT("action_schema"),
+		TEXT("Return a registered ACTION's param schema (names, types, required, defaults, aliases, descriptions) by (target_namespace, action). Closes param-name discoverability so callers stop trial-and-erroring param names."),
+		FMonolithActionHandler::CreateStatic(&HandleDescribeActionSchema),
+		BuildDescribeActionSchemaSchema());
+
+	UE_LOG(LogMonolith, Log, TEXT("MonolithBulkFillActions: registered 2 namespaces (bulk_fill + describe) with 5 actions total"));
 }
 
 void FMonolithBulkFillActions::UnregisterAll()

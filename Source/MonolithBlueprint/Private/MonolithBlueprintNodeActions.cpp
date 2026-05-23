@@ -1165,6 +1165,11 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		return FMonolithActionResult::Error(TEXT("Failed to create node — NewObject returned null"));
 	}
 
+	// Gap #15: every authored K2Node must carry a valid NodeGuid, else UE's cook path
+	// warns "missing NodeGuid ... deterministic cooking issues". All node-type branches
+	// converge here, so a single CreateNewGuid covers them all.
+	NewNode->CreateNewGuid();
+
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
 	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode);
@@ -2776,6 +2781,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimeline(const TSh
 	// Step 5: Add to graph and allocate pins
 	Graph->AddNode(TimelineNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 	TimelineNode->AllocateDefaultPins();
+	TimelineNode->CreateNewGuid(); // Gap #15: NodeGuid (distinct from TimelineGuid) for deterministic cooking
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
@@ -2957,6 +2963,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddEventNode(const TS
 		EventNode->NodePosY = PosY;
 		Graph->AddNode(EventNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 		EventNode->AllocateDefaultPins();
+		EventNode->CreateNewGuid(); // Gap #15: valid NodeGuid for deterministic cooking
 
 		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
@@ -2983,6 +2990,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddEventNode(const TS
 		EventNode->NodePosY = PosY;
 		Graph->AddNode(EventNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 		EventNode->AllocateDefaultPins();
+		EventNode->CreateNewGuid(); // Gap #15: valid NodeGuid for deterministic cooking
 
 		// RPC / Multicast replication flags (Phase 5A)
 		bool bNetFlagsChanged = false;
@@ -3146,6 +3154,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddCommentNode(const 
 	}
 
 	Graph->AddNode(CommentNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+	CommentNode->CreateNewGuid(); // Gap #15: valid NodeGuid for deterministic cooking
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
@@ -3307,6 +3316,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 		GetNode->NodePosY = VarNodePosY;
 		Graph->AddNode(GetNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 		GetNode->AllocateDefaultPins();
+		GetNode->CreateNewGuid(); // Gap #15: valid NodeGuid for deterministic cooking
 		VarNode = GetNode;
 
 		// Rewire: connect the VariableGet's output to each of the original pin's consumers
@@ -3353,6 +3363,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 		SetNode->NodePosY = VarNodePosY;
 		Graph->AddNode(SetNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 		SetNode->AllocateDefaultPins();
+		SetNode->CreateNewGuid(); // Gap #15: valid NodeGuid for deterministic cooking
 		VarNode = SetNode;
 
 		// Find the input data pin on the VariableSet node (the value pin, not exec)

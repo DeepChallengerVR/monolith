@@ -14,11 +14,11 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 90 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 92 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-### Actions (90 — namespace: "blueprint")
+### Actions (92 — namespace: "blueprint")
 
 **Read Actions (14)**
 | Action | Params | Description |
@@ -59,10 +59,11 @@
 | `set_component_property` | `asset_path`, `component_name`, `property_name`, `value` | Set a property on a component via reflection |
 | `duplicate_component` | `asset_path`, `component_name`, `new_name` | Duplicate a component with all its settings |
 
-**Graph Management (9)**
+**Graph Management (10)**
 | Action | Params | Description |
 |--------|--------|-------------|
 | `add_function` | `asset_path`, `function_name` | Add a new function graph |
+| `override_parent_function` | `asset_path`, `parent_function_name` | Author a Blueprint override of an overridable parent function (`BlueprintImplementableEvent` / `BlueprintNativeEvent`), including those that RETURN a value (e.g. `UCommonActivatableWidget::BP_GetDesiredFocusTarget` → `UWidget*`) — which `add_function` cannot do and the event-node form has no ReturnValue pin for. Declaring class resolved generically by name. Returns `graph_name`, `entry_node_id`, `return_pin_id`, `return_pin_name`, `override_class`, `has_return_value` |
 | `remove_function` | `asset_path`, `function_name` | Remove a function graph |
 | `rename_function` | `asset_path`, `old_name`, `new_name` | Rename a function graph |
 | `add_macro` | `asset_path`, `macro_name` | Add a new macro graph |
@@ -83,10 +84,13 @@
 | `set_node_position` | `asset_path`, `graph_name`, `node_id`, `x`, `y` | Set a node's position in the graph |
 | `add_property_access` | `asset_path`, `graph_name`?, `member_class`, `member_name`, `is_setter`? | Author a cross-class `VariableGet`/`Set` reading/writing a UPROPERTY on an arbitrary foreign class (resolved by string via `FindFirstObject<UClass>` — never hardcoded). Calls `FMemberReference::SetExternalMember` then `AllocateDefaultPins` so the value pin resolves to the property's real type (not wildcard); resolves to the declaring class up the hierarchy. Sets a valid NodeGuid. Returns `node_id`, `value_pin_id`, `target_pin_id`. Unblocks reading a property off a passed-in object reference (e.g. iterate array-of-foreign-structs). `target_class` accepted as alias for `member_class`. |
 
-**Compile & Create (5)**
+**NodeGuid note (#15):** Every MCP node-creation path above (`add_node`, `add_event_node`, `add_timeline`, `promote_pin_to_variable`, `add_comment_node`, and `add_property_access`) calls `UEdGraphNode::CreateNewGuid()` after creation, so MCP-authored nodes carry valid GUIDs and no longer risk invalid-GUID warnings on compile/save.
+
+**Compile & Create (6)**
 | Action | Params | Description |
 |--------|--------|-------------|
 | `compile_blueprint` | `asset_path` | Compile the Blueprint and return errors/warnings |
+| `save_dirty_assets` | `path_prefix`? (default `/Game`; empty string saves all) | Save ALL currently-dirty Blueprint and Widget Blueprint packages in one sweep — closes the data-loss window after a batch of edit actions that dirty packages but do not persist them. Returns `saved[]`, `failed[]`, `count` |
 | `validate_blueprint` | `asset_path` | Validate Blueprint without full compile — checks for broken references and missing overrides |
 | `create_blueprint` | `save_path`, `parent_class` | Create a new Blueprint asset |
 | `duplicate_blueprint` | `asset_path`, `new_path` | Duplicate a Blueprint asset to a new path |

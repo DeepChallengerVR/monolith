@@ -53,7 +53,7 @@ Framework-level dispatchers for transacted JSON-tree writes against any register
 | `apply` | `bulk_fill_query` | Apply a JSON `tree` to `target` under `target_namespace`. Routes to the per-namespace adapter via `FMonolithBulkFillRegistry`. Params: `target_namespace` (string), `target` (asset path or class identifier), `tree` (nested JSON), `dry_run` (bool, default false — returns full `FDryRunReport` without mutation), `strict` (bool, default false — promotes silent drops / clamps / unknown-fields to hard errors and cancels the transaction). Returns the populated `FDryRunReport` either way. |
 | `list_namespaces` | `bulk_fill_query` | Enumerate registered adapter namespaces and their `available` flag (false when the owning module's `WITH_*` gate is off — e.g. `gas` adapter `available:false` when `WITH_GBA=0`). No params. Use before `apply` to confirm the target namespace is hot in the current build. |
 
-### Actions (2 — namespace: "describe")
+### Actions (3 — namespace: "describe")
 
 Read-only schema introspection companion to `bulk_fill`. Same 12 adapter namespaces, same registry.
 
@@ -61,5 +61,6 @@ Read-only schema introspection companion to `bulk_fill`. Same 12 adapter namespa
 |--------|----------|-------------|
 | `schema` | `describe_query` | Return the rich `FSchemaDescriptor` tree for `target` under `target_namespace`. Params: `target_namespace` (string), `target` (asset path or class — empty string returns a root descriptor enumerating every supported `fill_kind` for the namespace). Output includes ImportText sample forms, `range_min` / `range_max`, `enum_values`, `conditional_on` discriminators for tagged-union fields. Authoritative input source for authoring valid `bulk_fill.apply` payloads. |
 | `list_targets` | `describe_query` | Enumerate the legal `target` shapes for a namespace's adapter (asset class names, fill_kind discriminators). Params: `target_namespace` (string). |
+| `action_schema` | `describe_query` | Return a registered ACTION's param schema (names, types, required, defaults, aliases, descriptions) by `(target_namespace, action)`. Params: `target_namespace` (string), `action` (string). Closes param-name discoverability so callers stop trial-and-erroring param names. |
 
 ---
