@@ -471,6 +471,18 @@ Actor->MarkPackageDirty();         // once all components are added
 
 ---
 
+### Preview & Inspection Surface (`editor::`)
+
+The `editor::` namespace exposes a tight family of capture and inspect actions that let AI agents introspect Unreal assets at higher fidelity than the default 256² thumbnail. Four new actions land alongside three extensions to the existing `editor::capture_scene_preview`. **Extended `asset_type` enum values:** `static_mesh`, `skeletal_mesh` (with optional `animation_path` + `seek_time` for posed-frame capture), and `widget` (UMG via `FWidgetRenderer` with `scale` DPI multiplier) join the prior `material` / `niagara`. **New actions:** `editor::capture_material_grid` (N material instances side-by-side under shared lighting, auto-grid via `ceil(sqrt(N))` with optional `columns` override); `editor::capture_with_overlay` (single-asset capture under one of five engine debug-view show flags — `wireframe`, `normals`, `uv_density`, `lightmap_density`, `shader_complexity`); `editor::inspect_material_pbr` (reflective walk of a material's texture parameter list, classifying each by PBR slot and detecting ORM / ARM / MRA channel-packing — pure JSON, no rendering); `editor::inspect_texture_channels` (per-channel R/G/B/A min/max/mean statistics + optional per-channel split PNGs via `emit_splits`). All seven are editor-only and live in `MonolithEditor`.
+
+The canonical pattern for the capture-style actions is `FAdvancedPreviewScene` + `USceneCaptureComponent2D` + `UTextureRenderTarget2D` + `FImageUtils::SaveImageAutoFormat` (mirrors the existing `HandleCaptureScenePreview` recipe — game-thread invoke, render-thread enqueue via `CaptureScene()`, readback via `GameThread_GetRenderTargetResource()->ReadPixels()`). The widget path additionally uses `FWidgetRenderer::DrawWidget` against the same RT (guard with `FApp::CanEverRender()` — headless commandlets and `-nullrhi` will return a clear error). The inspect-style actions skip the render path entirely: `inspect_material_pbr` walks `UMaterialEditingLibrary::GetTextureParameterNames` + `GetTextureParameterValue` then routes each through a small PBR classifier; `inspect_texture_channels` locks the source mip via `FTextureSource::LockMipReadOnly`, computes statistics in a single pass, and writes split PNGs only when `emit_splits=true`.
+
+Source-of-truth files: `Source/MonolithEditor/Private/MonolithEditorActions.cpp` (the `asset_type` enum extension lives inside `HandleCaptureScenePreview`), `Source/MonolithEditor/Private/MonolithEditorPreviewActions.cpp` (`capture_material_grid` + `capture_with_overlay`), `Source/MonolithEditor/Private/MonolithEditorInspectActions.cpp` (`inspect_material_pbr` + `inspect_texture_channels`). Header surface lives in `Source/MonolithEditor/Public/MonolithEditorActions.h` (four new static handler declarations alongside the existing capture handler).
+
+AI discoverability: `monolith_guide(section="recipes")` returns Recipe 5 ("Visual introspection — going beyond thumbnails") and Recipe 6 ("Reading asset structure without rendering"); `monolith_guide(section="decisions")` returns the `capture_scene_preview` vs `capture_material_grid` vs `inspect_material_pbr` decision matrix. Live schemas come from `monolith_discover("editor")`.
+
+---
+
 ## 11. Known Issues & Workarounds
 
 See `TODO.md` for the full list. Key architectural constraints:

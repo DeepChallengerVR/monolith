@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Preview & inspection surface expansion (`editor::` namespace):** extended
+  `editor::capture_scene_preview` `asset_type` enum to support `static_mesh`,
+  `skeletal_mesh` (with optional `animation_path` + `seek_time` for posed
+  capture), and `widget` (UMG via `FWidgetRenderer` with `scale` DPI multiplier).
+  New `editor::capture_material_grid` (N material instances side-by-side under
+  shared lighting; auto-grid layout via `ceil(sqrt(N))` with optional `columns`
+  override). New `editor::capture_with_overlay` (5 engine debug-view modes:
+  wireframe, normals, uv_density, lightmap_density, shader_complexity). New
+  `editor::inspect_material_pbr` (PBR texture parameter classification +
+  ORM/ARM/MRA channel-packing detection — pure reflection, no rendering). New
+  `editor::inspect_texture_channels` (per-channel R/G/B/A min/max/mean
+  statistics + optional per-channel split PNGs). All editor-only. AI
+  discoverability via new `monolith_guide` recipe entries.
+
 ### Fixed
 
 - **Component persistence (Issue #63, @Heiselisha):** `mesh.convert_to_hism`, `mesh.place_spline`, and
