@@ -26,13 +26,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Both proxies advertise the universal params on every tool's inputSchema.** `Tools/MonolithProxy/monolith_proxy.cpp` (native) and `Scripts/monolith_proxy.py` (Python fallback) now emit `_fields` / `_omit` / `_compact_json` on every tool descriptor returned from `tools/list`. **The native proxy requires a `build_proxy.bat` rebuild + Claude Code MCP reconnect** to engage end-to-end; the Python fallback picks up the change on next restart.
 
+- **(LLM ergonomics, Phase 1.1) Per-namespace `AssetPath` / `DiskPath` tagging sweep across 87 `*Actions.cpp` files.** Realises Phase 1.0 survivor D's value: ~913 builder call sites tagged `AssetPath` (the dispatcher now silently rewrites backslash→forward-slash on those params with a surfaced warning), ~18 tagged `DiskPath` (handler expects native paths — opt OUT of rewrite), ~50 left as `Other` (class identifiers, dotted property/struct paths, Outliner folders, glob filters, default-bearing optionals, ambiguous semantics). Counter-example handlers explicitly DiskPath where audit found native-backslash dependence: source `read_file`, source-image / GAS-tag import `source_path`, FBX export `file_path`, debug-view PNG output paths, LogicDriver `json_path_or_data`, Material `include_file_paths` HLSL virtuals. `MonolithGASCueActions save_path_prefix` left as `Other` (trailing-slash directory-join semantics). Pure call-site refactor atop Phase 1.0 sugar overloads — no `*.Build.cs` / `.uplugin` / module-dep delta. UBT exit 0, 0 errors / 0 warnings.
+
 ### Internal
 
 - **+11 automation tests** under `Monolith.ResponseShaping.*` and `Monolith.ParamKind.*` (Phase 1.0) — all passing. Cover whitelist / blacklist / mutual-exclusion / compact-drop / non-`AssetPath` pass-through / K3 strict-params interaction.
 
 - **+10 automation tests** under `Monolith.FuzzyMatch.*` (Phase 2 — 5/5 passing) and `Monolith.CursorPagination.*` (Phase 3 — 5/5 passing). Phase 1.0 brought 11; Monolith total across Phases 1.0–4 is +21 tests.
 
-- **No new MCP actions registered across Phases 1.0 / 2 / 3 / 4** — the response-shaping surface is universal post-dispatch, the param-kind enum is a schema-tag opt-in, fuzzy match piggybacks on dispatch errors, cursor pagination extends an existing action surface in-place, and the proxy call log is proxy-side. Action count is unchanged from v0.16.0 baseline. No `*.Build.cs` changes. No `.uplugin` changes. No new module dependencies.
+- **No new MCP actions registered across Phases 1.0 / 1.1 / 2 / 3 / 4** — the response-shaping surface is universal post-dispatch, the param-kind enum is a schema-tag opt-in (87-file sweep tagged registrations only — no new actions), fuzzy match piggybacks on dispatch errors, cursor pagination extends an existing action surface in-place, and the proxy call log is proxy-side. Action count is unchanged from v0.16.0 baseline. No `*.Build.cs` changes. No `.uplugin` changes. No new module dependencies.
 
 ## [0.16.0] - 2026-05-27
 
