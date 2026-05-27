@@ -108,6 +108,14 @@ TArray<FString> FMonolithParamSchema::FindUnknownKeys(
 	// Legacy wbp_path/asset_path back-compat: allow asset_path everywhere.
 	Allowed.Add(TEXT("asset_path"));
 
+	// Survivor B (plan §3.B) — universal response-shaping params. Allow these
+	// on EVERY action so the K3 STRICT_PARAMS=1 path does not hard-fail on
+	// `_fields` / `_omit` / `_compact_json`. The post-filter at the bottom
+	// of ExecuteAction consumes + acts on them.
+	Allowed.Add(TEXT("_fields"));
+	Allowed.Add(TEXT("_omit"));
+	Allowed.Add(TEXT("_compact_json"));
+
 	for (const auto& Pair : Params->Values)
 	{
 		if (!Allowed.Contains(Pair.Key))
@@ -256,6 +264,51 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		}
 	}
 
+	// Survivor D (plan §3.D) — schema-tagged AssetPath \→/ rewrite.
+	// Runs AFTER K2 alias rewrite (so the key the schema sees matches the
+	// param name in EffectiveParams) and BEFORE K3 unknown-key check.
+	// Only Kind == AssetPath is rewritten; all other Kinds (Other, DiskPath,
+	// GameplayTag) pass through. Warnings appended to the same K3 warnings[]
+	// channel by the post-handler block below.
+	TArray<FString> AssetPathRewriteWarnings;
+	if (ActionInfo.ParamSchema.IsValid())
+	{
+		for (const auto& SchemaPair : ActionInfo.ParamSchema->Values)
+		{
+			const TSharedPtr<FJsonObject>* ParamDefPtr = nullptr;
+			if (!SchemaPair.Value->TryGetObject(ParamDefPtr) || !ParamDefPtr || !ParamDefPtr->IsValid())
+			{
+				continue;
+			}
+			FString KindStr;
+			if (!(*ParamDefPtr)->TryGetStringField(TEXT("kind"), KindStr))
+			{
+				continue; // No kind tag → Other (default) → no rewrite.
+			}
+			if (MonolithParamKind::FromString(KindStr) != EMonolithParamKind::AssetPath)
+			{
+				continue;
+			}
+
+			const FString& ParamName = SchemaPair.Key;
+			FString Value;
+			if (!EffectiveParams->TryGetStringField(ParamName, Value))
+			{
+				continue;
+			}
+			if (!Value.Contains(TEXT("\\")))
+			{
+				continue;
+			}
+
+			FString Rewritten = Value.Replace(TEXT("\\"), TEXT("/"));
+			EffectiveParams->SetStringField(ParamName, Rewritten);
+			AssetPathRewriteWarnings.Add(FString::Printf(
+				TEXT("Normalised backslashes in 'asset_path' param '%s' — future calls should use forward slashes."),
+				*ParamName));
+		}
+	}
+
 	// K3 — unknown-key detection (after required-check, before dispatch).
 	TArray<FString> Unknown;
 	if (ActionInfo.ParamSchema.IsValid())
@@ -287,21 +340,42 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 
 	FMonolithActionResult ActionResult = HandlerCopy.Execute(EffectiveParams);
 
-	// On success, append `warnings` array for unknown params (K3 soft-warn mode).
-	if (ActionResult.bSuccess && Unknown.Num() > 0 && ActionResult.Result.IsValid())
+	// Collect ALL post-handler warnings into a single channel, then attach once.
+	// Sources, in order:
+	//   1. K3 unknown-param soft-warn (pre-existing behaviour)
+	//   2. Survivor D — AssetPath \→/ rewrite warnings (plan §3.D)
+	//   3. Survivor B — response-shaping warnings (plan §3.B, e.g. _fields/_omit collision)
+	if (ActionResult.bSuccess && ActionResult.Result.IsValid())
 	{
-		TArray<TSharedPtr<FJsonValue>> Existing;
-		const TArray<TSharedPtr<FJsonValue>>* Found = nullptr;
-		if (ActionResult.Result->TryGetArrayField(TEXT("warnings"), Found) && Found)
-		{
-			Existing = *Found;
-		}
+		TArray<FString> AllWarnings;
+		AllWarnings.Append(AssetPathRewriteWarnings);
 		for (const FString& K : Unknown)
 		{
-			Existing.Add(MakeShared<FJsonValueString>(
-				FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action)));
+			AllWarnings.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action));
 		}
-		ActionResult.Result->SetArrayField(TEXT("warnings"), Existing);
+
+		// Survivor B post-filter — mutates ActionResult.Result in-place and may
+		// append its own warnings (e.g., mutually-exclusive _fields + _omit).
+		// Runs BEFORE attaching the warnings array so its warnings get included
+		// in the final emit; runs AFTER warning collection so the filter cannot
+		// strip the warnings[] key out from under us via _fields whitelist.
+		// (We attach warnings to ActionResult.Result AFTER ApplyResponseShaping.)
+		ApplyResponseShaping(ActionResult.Result, EffectiveParams, AllWarnings);
+
+		if (AllWarnings.Num() > 0 && ActionResult.Result.IsValid())
+		{
+			TArray<TSharedPtr<FJsonValue>> Existing;
+			const TArray<TSharedPtr<FJsonValue>>* Found = nullptr;
+			if (ActionResult.Result->TryGetArrayField(TEXT("warnings"), Found) && Found)
+			{
+				Existing = *Found;
+			}
+			for (const FString& W : AllWarnings)
+			{
+				Existing.Add(MakeShared<FJsonValueString>(W));
+			}
+			ActionResult.Result->SetArrayField(TEXT("warnings"), Existing);
+		}
 	}
 
 	return ActionResult;

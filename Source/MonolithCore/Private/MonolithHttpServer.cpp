@@ -620,6 +620,64 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 		// Core tool: monolith_discover -> namespace="monolith", action="discover"
 		Namespace = TEXT("monolith");
 		Action = ToolName.Mid(9);
+
+		// Symmetric string-unwrap + top-level-extras merge (mirrors the *_query
+		// branch below). Some MCP clients (Claude Code) serialize the "params"
+		// object as a JSON-encoded string; others nest a real object; others
+		// scatter optional shaping flags (_fields/_omit/_compact_json) at the
+		// top level alongside the tool-specific args. Normalise all shapes
+		// so the dispatched action handler sees a single flat params object.
+		TSharedPtr<FJsonObject> TopLevelExtras = MakeShared<FJsonObject>();
+		for (const auto& Pair : Arguments->Values)
+		{
+			if (Pair.Key != TEXT("params"))
+			{
+				TopLevelExtras->SetField(Pair.Key, Pair.Value);
+			}
+		}
+
+		const TSharedPtr<FJsonObject>* NestedParams = nullptr;
+		TSharedPtr<FJsonObject> ParsedParamsObj; // lifetime holder for string-parsed params
+		bool bHasNestedParams = false;
+
+		if (Arguments->TryGetObjectField(TEXT("params"), NestedParams) && NestedParams)
+		{
+			bHasNestedParams = true;
+		}
+		else
+		{
+			// Try parsing "params" as a JSON string (Claude Code serializes objects to strings)
+			FString ParamsStr;
+			if (Arguments->TryGetStringField(TEXT("params"), ParamsStr) && !ParamsStr.IsEmpty())
+			{
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ParamsStr);
+				if (FJsonSerializer::Deserialize(Reader, ParsedParamsObj) && ParsedParamsObj.IsValid())
+				{
+					NestedParams = &ParsedParamsObj;
+					bHasNestedParams = true;
+				}
+			}
+		}
+
+		if (bHasNestedParams && NestedParams)
+		{
+			Arguments = MakeShared<FJsonObject>();
+			// Start with top-level extras (lower priority)
+			for (const auto& Pair : TopLevelExtras->Values)
+			{
+				Arguments->SetField(Pair.Key, Pair.Value);
+			}
+			// Overlay nested params (higher priority)
+			for (const auto& Pair : (*NestedParams)->Values)
+			{
+				Arguments->SetField(Pair.Key, Pair.Value);
+			}
+		}
+		else
+		{
+			// No nested "params" — use top-level fields as params directly
+			Arguments = TopLevelExtras;
+		}
 	}
 	else if (ToolName.EndsWith(TEXT("_query")) || ToolName.EndsWith(TEXT(".query")))
 	{

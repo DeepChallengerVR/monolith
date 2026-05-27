@@ -52,3 +52,27 @@ public:
 	// plugin" from "feature flag off").
 	static constexpr int32 ErrOptionalDepUnavailable = -32010;
 };
+
+/**
+ * Survivor B — universal response-shaping post-filter.
+ *
+ * Reads the three opt-in universal params from `Params` and mutates `Response`
+ * in-place. Phase 1 of plan §3.B (2026-05-27-mcp-llm-ergonomics.md):
+ *
+ *  - `_fields:["a","b"]`    — keep only these TOP-LEVEL response keys
+ *  - `_omit:["debug_info"]` — drop these TOP-LEVEL response keys
+ *  - `_compact_json:true`   — drop top-level keys whose value is null/""/{}/[]
+ *
+ * If both `_fields` and `_omit` are non-empty, `_fields` wins and a warning
+ * is appended. Empty `_fields` is a no-op (does NOT drop everything).
+ *
+ * TOP-LEVEL ONLY in Phase 1 — JSONPath / nested traversal is killed in §2
+ * of the plan as out-of-scope. Do not extend in this phase.
+ *
+ * `Warnings` is APPENDED to, not replaced; caller already owns the
+ * K3 `warnings[]` channel and post-attaches to `ActionResult.Result`.
+ */
+MONOLITHCORE_API void ApplyResponseShaping(
+	TSharedPtr<FJsonObject>& Response,
+	const TSharedPtr<FJsonObject>& Params,
+	TArray<FString>& Warnings);

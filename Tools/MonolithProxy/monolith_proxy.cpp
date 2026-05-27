@@ -406,6 +406,20 @@ static json make_query_tool_schema()
             {"params", {
                 {"type", "object"},
                 {"description", "Parameters for the selected action."}
+            }},
+            {"_fields", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Optional top-level whitelist — return only these top-level fields of the response. Mutually exclusive with _omit."}
+            }},
+            {"_omit", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Optional top-level blacklist — remove these top-level fields from the response. Mutually exclusive with _fields."}
+            }},
+            {"_compact_json", {
+                {"type", "boolean"},
+                {"description", "Optional — when true, drop top-level fields whose value is null, empty string, empty array, or empty object."}
             }}
         }},
         {"required", json::array({"action"})}
@@ -416,7 +430,22 @@ static json make_empty_object_schema()
 {
     return {
         {"type", "object"},
-        {"properties", json::object()}
+        {"properties", {
+            {"_fields", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Optional top-level whitelist — return only these top-level fields of the response. Mutually exclusive with _omit."}
+            }},
+            {"_omit", {
+                {"type", "array"},
+                {"items", {{"type", "string"}}},
+                {"description", "Optional top-level blacklist — remove these top-level fields from the response. Mutually exclusive with _fields."}
+            }},
+            {"_compact_json", {
+                {"type", "boolean"},
+                {"description", "Optional — when true, drop top-level fields whose value is null, empty string, empty array, or empty object."}
+            }}
+        }}
     };
 }
 
@@ -462,6 +491,20 @@ static json make_seed_tools()
                 {"category", {
                     {"type", "string"},
                     {"description", "Optional: filter actions within the namespace by category"}
+                }},
+                {"_fields", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Optional top-level whitelist — return only these top-level fields of the response. Mutually exclusive with _omit."}
+                }},
+                {"_omit", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Optional top-level blacklist — remove these top-level fields from the response. Mutually exclusive with _fields."}
+                }},
+                {"_compact_json", {
+                    {"type", "boolean"},
+                    {"description", "Optional — when true, drop top-level fields whose value is null, empty string, empty array, or empty object."}
                 }}
             }}
         }));
@@ -481,6 +524,20 @@ static json make_seed_tools()
                     {"type", "string"},
                     {"description", "'check' to compare versions, 'install' to download and stage update"},
                     {"default", "check"}
+                }},
+                {"_fields", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Optional top-level whitelist — return only these top-level fields of the response. Mutually exclusive with _omit."}
+                }},
+                {"_omit", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Optional top-level blacklist — remove these top-level fields from the response. Mutually exclusive with _fields."}
+                }},
+                {"_compact_json", {
+                    {"type", "boolean"},
+                    {"description", "Optional — when true, drop top-level fields whose value is null, empty string, empty array, or empty object."}
                 }}
             }}
         }));
