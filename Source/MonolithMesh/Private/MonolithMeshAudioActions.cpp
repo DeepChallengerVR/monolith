@@ -332,7 +332,7 @@ void FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshAudioActions::CreateSurfaceDataTable),
 		FParamSchemaBuilder()
 			.Optional(TEXT("template"), TEXT("string"), TEXT("Template to use: 'horror_default'"), TEXT("horror_default"))
-			.Optional(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the DataTable (default from settings)"))
+			.OptionalAssetPath(TEXT("save_path"), TEXT("Asset path for the DataTable (default from settings)"))
 			.Build());
 }
 

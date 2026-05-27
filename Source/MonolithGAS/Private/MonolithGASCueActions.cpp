@@ -31,7 +31,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Create a GameplayCue Notify Blueprint (Burst, Looping/Actor, or BurstLatent/Static). Auto-sets the GameplayCue tag on the CDO."),
 		FMonolithActionHandler::CreateStatic(&HandleCreateGameplayCueNotify),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new GCN Blueprint (e.g. '/Game/GAS/Cues/GCN_Status_Burning')"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new GCN Blueprint (e.g. '/Game/GAS/Cues/GCN_Status_Burning')"))
 			.Required(TEXT("cue_tag"), TEXT("string"), TEXT("GameplayCue tag (e.g. 'GameplayCue.Status.Burning')"))
 			.Optional(TEXT("type"), TEXT("string"), TEXT("Cue type: 'burst' (UGameplayCueNotify_Static, fire-and-forget), 'looping' (AGameplayCueNotify_Actor, attach to target), 'burst_latent' (UGameplayCueNotify_Static, burst with duration). Default: burst"), TEXT("burst"))
 			.Build());
@@ -40,7 +40,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Add a GameplayCue tag to a GameplayEffect so it triggers the cue on application"),
 		FMonolithActionHandler::CreateStatic(&HandleLinkCueToEffect),
 		FParamSchemaBuilder()
-			.Required(TEXT("effect_path"), TEXT("string"), TEXT("GameplayEffect Blueprint asset path"))
+			.RequiredAssetPath(TEXT("effect_path"), TEXT("GameplayEffect Blueprint asset path"))
 			.Required(TEXT("cue_tag"), TEXT("string"), TEXT("GameplayCue tag to add (e.g. 'GameplayCue.Status.Burning')"))
 			.Build());
 
@@ -48,7 +48,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Remove a GameplayCue tag from a GameplayEffect"),
 		FMonolithActionHandler::CreateStatic(&HandleUnlinkCueFromEffect),
 		FParamSchemaBuilder()
-			.Required(TEXT("effect_path"), TEXT("string"), TEXT("GameplayEffect Blueprint asset path"))
+			.RequiredAssetPath(TEXT("effect_path"), TEXT("GameplayEffect Blueprint asset path"))
 			.Required(TEXT("cue_tag"), TEXT("string"), TEXT("GameplayCue tag to remove"))
 			.Build());
 
@@ -58,7 +58,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Read GameplayCue Notify config: tag, type (burst/looping), particles, sounds, camera shakes"),
 		FMonolithActionHandler::CreateStatic(&HandleGetCueInfo),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("GCN Blueprint or class asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("GCN Blueprint or class asset path"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("gas"), TEXT("list_gameplay_cues"),
@@ -73,7 +73,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Configure burst/loop particles, sounds, camera shakes on a GameplayCue Notify via CDO reflection"),
 		FMonolithActionHandler::CreateStatic(&HandleSetCueParameters),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("GCN Blueprint asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("GCN Blueprint asset path"))
 			.Optional(TEXT("burst_particle"), TEXT("string"), TEXT("Particle system asset path for burst effect"))
 			.Optional(TEXT("burst_sound"), TEXT("string"), TEXT("Sound asset path for burst"))
 			.Optional(TEXT("loop_particle"), TEXT("string"), TEXT("Particle system asset path for looping effect"))
@@ -92,7 +92,7 @@ void FMonolithGASCueActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Find GEs with cue tags that lack matching cue handlers, and orphaned cues with no GE trigger"),
 		FMonolithActionHandler::CreateStatic(&HandleValidateCueCoverage),
 		FParamSchemaBuilder()
-			.Optional(TEXT("path_filter"), TEXT("string"), TEXT("Restrict scan to assets under this path"))
+			.OptionalAssetPath(TEXT("path_filter"), TEXT("Restrict scan to assets under this path"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("gas"), TEXT("batch_create_cues"),

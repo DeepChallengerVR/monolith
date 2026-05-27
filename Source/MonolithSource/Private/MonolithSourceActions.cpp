@@ -99,7 +99,7 @@ void FMonolithSourceActions::RegisterAll()
 		TEXT("Read source lines from a file by path"),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleReadFile),
 		FParamSchemaBuilder()
-			.Required(TEXT("file_path"), TEXT("string"), TEXT("Source file path"))
+			.RequiredDiskPath(TEXT("file_path"), TEXT("Source file path"))
 			.Optional(TEXT("start_line"), TEXT("integer"), TEXT("First line to read"), TEXT("1"))
 			.Optional(TEXT("end_line"), TEXT("integer"), TEXT("Last line to read"))
 			.Build());

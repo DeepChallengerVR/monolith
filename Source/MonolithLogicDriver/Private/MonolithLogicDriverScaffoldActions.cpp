@@ -103,7 +103,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create a ready-to-use SM Blueprint with 3 states (Idle->Active->Complete) and transitions — a quick-start template"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldHelloWorldSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_HelloWorld)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_HelloWorld)"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Asset name (default: SM_HelloWorld)"))
 			.Build());
 
@@ -111,7 +111,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create an FPS weapon state machine: Idle->Drawing->Ready->Firing->Cooldown->Reloading with transitions"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldWeaponSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_Weapon)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_Weapon)"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Asset name (default: SM_Weapon)"))
 			.Build());
 
@@ -119,7 +119,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create a horror encounter state machine: Dormant->Lurking->Stalking->Chasing->Attacking->Retreating->Despawned"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldHorrorEncounterSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_HorrorEncounter)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_HorrorEncounter)"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Asset name (default: SM_HorrorEncounter)"))
 			.Build());
 
@@ -127,7 +127,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create a game flow state machine: MainMenu->Loading->Gameplay->Pause->Results->Credits with loops"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldGameFlowSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_GameFlow)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM (e.g. /Game/StateMachines/SM_GameFlow)"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Asset name (default: SM_GameFlow)"))
 			.Build());
 
@@ -135,7 +135,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create a dialogue state machine with speaker/text states wired in sequence, with optional branching choices"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldDialogueSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Asset name"))
 			.Optional(TEXT("dialogue_nodes"), TEXT("array"), TEXT("Array of {speaker, text, choices?:[string]} — each becomes a state"))
 			.Build());
@@ -144,7 +144,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create a quest state machine: Inactive -> Active -> [objectives] -> Complete/Failed"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldQuestSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Asset name"))
 			.Optional(TEXT("objectives"), TEXT("array"), TEXT("Array of objective name strings (each becomes a state)"))
 			.Build());
@@ -153,7 +153,7 @@ void FMonolithLogicDriverScaffoldActions::RegisterActions(FMonolithToolRegistry&
 		TEXT("Create an interactable state machine with custom states (default: locked/unlocked/open/closed)"),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldInteractableSM),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the new SM"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the new SM"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Asset name"))
 			.Optional(TEXT("states"), TEXT("array"), TEXT("Array of state name strings (default: ['locked','unlocked','open','closed'])"))
 			.Build());

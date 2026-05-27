@@ -53,7 +53,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			"Each step is also available as a standalone action for finer control."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshCityBlockActions::CreateCityBlock),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path_prefix"), TEXT("string"), TEXT("Base path for all generated assets (e.g. /Game/CityBlock/Block_01)"))
+			.RequiredAssetPath(TEXT("save_path_prefix"), TEXT("Base path for all generated assets (e.g. /Game/CityBlock/Block_01)"))
 			.Optional(TEXT("buildings"), TEXT("integer"), TEXT("Number of buildings"), TEXT("4"))
 			.Optional(TEXT("block_size"), TEXT("array"), TEXT("[width, height] in cm"), TEXT("[6000,4000]"))
 			.Optional(TEXT("genre"), TEXT("string"), TEXT("horror, suburban, downtown"), TEXT("horror"))
@@ -100,7 +100,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 		FParamSchemaBuilder()
 			.Required(TEXT("start"), TEXT("array"), TEXT("[x, y] start point"))
 			.Required(TEXT("end"), TEXT("array"), TEXT("[x, y] end point"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path to save street mesh"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path to save street mesh"))
 			.Optional(TEXT("width"), TEXT("number"), TEXT("Road width in cm"), TEXT("600"))
 			.Optional(TEXT("sidewalk_width"), TEXT("number"), TEXT("Per-side sidewalk width in cm"), TEXT("200"))
 			.Optional(TEXT("curb_height"), TEXT("number"), TEXT("Curb height in cm"), TEXT("15"))
@@ -124,7 +124,7 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("offset"), TEXT("number"), TEXT("Offset from street center in cm"), TEXT("250"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed"))
 			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder"))
-			.Optional(TEXT("save_path_prefix"), TEXT("string"), TEXT("Base asset path for furniture meshes"))
+			.OptionalAssetPath(TEXT("save_path_prefix"), TEXT("Base asset path for furniture meshes"))
 			.Optional(TEXT("decay"), TEXT("number"), TEXT("Decay level 0-1 — broken/tilted furniture"), TEXT("0"))
 			.Build());
 }

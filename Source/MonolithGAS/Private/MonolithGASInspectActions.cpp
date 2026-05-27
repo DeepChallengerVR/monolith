@@ -33,8 +33,8 @@ void FMonolithGASInspectActions::RegisterActions(FMonolithToolRegistry& Registry
 		FParamSchemaBuilder()
 			.Optional(TEXT("format"), TEXT("string"), TEXT("Output format: 'json' (default)"), TEXT("json"))
 			.Optional(TEXT("include_relationships"), TEXT("boolean"), TEXT("Include cross-asset references (effect->attribute, ability->effect, cue->effect)"), TEXT("true"))
-			.Optional(TEXT("output_path"), TEXT("string"), TEXT("File path to write manifest (default: returns inline)"))
-			.Optional(TEXT("path_filter"), TEXT("string"), TEXT("Restrict to assets under this path"))
+			.OptionalDiskPath(TEXT("output_path"), TEXT("File path to write manifest (default: returns inline)"))
+			.OptionalAssetPath(TEXT("path_filter"), TEXT("Restrict to assets under this path"))
 			.Build());
 
 	// Phase 4: Runtime Debug (PIE required)

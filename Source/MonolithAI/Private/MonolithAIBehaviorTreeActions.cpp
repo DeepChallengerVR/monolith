@@ -1516,9 +1516,9 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Create a new Behavior Tree asset, optionally linking a Blackboard"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateBehaviorTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset save path (e.g. /Game/AI/BT_Enemy)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset save path (e.g. /Game/AI/BT_Enemy)"))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Asset name (derived from save_path if omitted)"))
-			.Optional(TEXT("blackboard_path"), TEXT("string"), TEXT("Blackboard asset path to link"))
+			.OptionalAssetPath(TEXT("blackboard_path"), TEXT("Blackboard asset path to link"))
 			.Build());
 
 	// 14. get_behavior_tree
@@ -1526,7 +1526,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Full tree structure as JSON — nodes, decorators, services, hierarchy from root"),
 		FMonolithActionHandler::CreateStatic(&HandleGetBehaviorTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Build());
 
 	// 15. list_behavior_trees
@@ -1534,7 +1534,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("List all UBehaviorTree assets in the project"),
 		FMonolithActionHandler::CreateStatic(&HandleListBehaviorTrees),
 		FParamSchemaBuilder()
-			.Optional(TEXT("path_filter"), TEXT("string"), TEXT("Only include assets under this path prefix"))
+			.OptionalAssetPath(TEXT("path_filter"), TEXT("Only include assets under this path prefix"))
 			.Build());
 
 	// 16. delete_behavior_tree
@@ -1542,7 +1542,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Delete a Behavior Tree asset"),
 		FMonolithActionHandler::CreateStatic(&HandleDeleteBehaviorTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path to delete"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path to delete"))
 			.Build());
 
 	// 17. duplicate_behavior_tree
@@ -1550,8 +1550,8 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Deep copy a Behavior Tree asset to a new path"),
 		FMonolithActionHandler::CreateStatic(&HandleDuplicateBehaviorTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("source_path"), TEXT("string"), TEXT("Source BT asset path"))
-			.Required(TEXT("dest_path"), TEXT("string"), TEXT("Destination asset path for the copy"))
+			.RequiredAssetPath(TEXT("source_path"), TEXT("Source BT asset path"))
+			.RequiredAssetPath(TEXT("dest_path"), TEXT("Destination asset path for the copy"))
 			.Build());
 
 	// 18. set_bt_blackboard
@@ -1559,8 +1559,8 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Set or change the Blackboard reference on a Behavior Tree"),
 		FMonolithActionHandler::CreateStatic(&HandleSetBTBlackboard),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
-			.Required(TEXT("blackboard_path"), TEXT("string"), TEXT("Blackboard asset path to link (empty string to clear)"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("blackboard_path"), TEXT("Blackboard asset path to link (empty string to clear)"))
 			.Build());
 
 	// 29. list_bt_node_classes
@@ -1576,7 +1576,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Add a composite or task node to a Behavior Tree. parent_id=null adds under root."),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTNode),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("parent_id"), TEXT("string"), TEXT("GUID of parent composite node (null = root)"))
 			.Required(TEXT("node_class"), TEXT("string"), TEXT("BT node class name (e.g. BTTask_Wait, BTComposite_Sequence)"))
 			.Optional(TEXT("index"), TEXT("number"), TEXT("Child index under parent (-1 or omit = append)"))
@@ -1588,7 +1588,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Remove a node and its children from a Behavior Tree"),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveBTNode),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node to remove"))
 			.Build());
 
@@ -1597,7 +1597,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Reparent a node under a different composite in the Behavior Tree"),
 		FMonolithActionHandler::CreateStatic(&HandleMoveBTNode),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node to move"))
 			.Required(TEXT("new_parent_id"), TEXT("string"), TEXT("GUID of the new parent composite node"))
 			.Optional(TEXT("index"), TEXT("number"), TEXT("Child index under new parent (-1 or omit = append)"))
@@ -1608,7 +1608,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Add a decorator as a sub-node on a target BT node"),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTDecorator),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the target node"))
 			.Required(TEXT("decorator_class"), TEXT("string"), TEXT("Decorator class name (e.g. BTDecorator_Blackboard)"))
 			.Optional(TEXT("properties"), TEXT("object"), TEXT("JSON object of property_name→value pairs to set"))
@@ -1619,7 +1619,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Remove a decorator from a BT node by index"),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveBTDecorator),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node that owns the decorator"))
 			.Required(TEXT("decorator_index"), TEXT("number"), TEXT("Index of the decorator to remove"))
 			.Build());
@@ -1629,7 +1629,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Add a service as a sub-node on a composite or task node"),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTService),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the target node"))
 			.Required(TEXT("service_class"), TEXT("string"), TEXT("Service class name (e.g. BTService_DefaultFocus)"))
 			.Optional(TEXT("properties"), TEXT("object"), TEXT("JSON object of property_name→value pairs to set"))
@@ -1640,7 +1640,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Remove a service from a BT node by index"),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveBTService),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node that owns the service"))
 			.Required(TEXT("service_index"), TEXT("number"), TEXT("Index of the service to remove"))
 			.Build());
@@ -1650,7 +1650,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Set a UPROPERTY on a BT node instance. Special handling for FBlackboardKeySelector."),
 		FMonolithActionHandler::CreateStatic(&HandleSetBTNodeProperty),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node"))
 			.Required(TEXT("property_name"), TEXT("string"), TEXT("UPROPERTY name to set"))
 			.Required(TEXT("value"), TEXT("any"), TEXT("Value to set (type depends on property)"))
@@ -1661,7 +1661,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Read all UPROPERTYs from a BT node instance"),
 		FMonolithActionHandler::CreateStatic(&HandleGetBTNodeProperties),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the node"))
 			.Build());
 
@@ -1670,7 +1670,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Reorder child nodes under a composite by specifying new GUID order"),
 		FMonolithActionHandler::CreateStatic(&HandleReorderBTChildren),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Required(TEXT("parent_id"), TEXT("string"), TEXT("GUID of the parent composite node"))
 			.Required(TEXT("new_order"), TEXT("array"), TEXT("Array of child node GUIDs in desired order"))
 			.Build());
@@ -1680,9 +1680,9 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Convenience: add a fully configured RunEQSQuery task node"),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTRunEQSTask),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("parent_id"), TEXT("string"), TEXT("GUID of parent composite node (null = root)"))
-			.Required(TEXT("eqs_path"), TEXT("string"), TEXT("EQS query asset path"))
+			.RequiredAssetPath(TEXT("eqs_path"), TEXT("EQS query asset path"))
 			.Required(TEXT("bb_result_key"), TEXT("string"), TEXT("Blackboard key to store result"))
 			.Optional(TEXT("run_mode"), TEXT("string"), TEXT("EEnvQueryRunMode (SingleBestItem, AllMatching, etc.)"))
 			.Build());
@@ -1692,7 +1692,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Convenience: add a FindAndUseSmartObject task node"),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTSmartObjectTask),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("parent_id"), TEXT("string"), TEXT("GUID of parent composite node (null = root)"))
 			.Required(TEXT("activity_tags"), TEXT("string"), TEXT("Gameplay tag query for SO activities (e.g. Activity.Sit)"))
 			.Optional(TEXT("search_radius"), TEXT("number"), TEXT("Search radius for smart objects (default 5000)"))
@@ -1706,7 +1706,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Convenience: add a fully configured TryActivateAbility task node that fires a GAS ability on tick"),
 		FMonolithActionHandler::CreateStatic(&HandleAddBTUseAbilityTask),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("parent_id"), TEXT("string"), TEXT("GUID of parent composite node (null = root)"))
 			.Optional(TEXT("ability_class"), TEXT("string"),
 				TEXT("Asset path or class name of UGameplayAbility subclass (mutually exclusive with ability_tags)"),
@@ -1728,7 +1728,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Create a complete Behavior Tree from a declarative JSON spec — the crown jewel"),
 		FMonolithActionHandler::CreateStatic(&HandleBuildBTFromSpec),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset save path (e.g. /Game/AI/BT_Enemy)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset save path (e.g. /Game/AI/BT_Enemy)"))
 			.Required(TEXT("spec"), TEXT("object"), TEXT("Full tree spec with root, children, decorators, services, properties"))
 			.Optional(TEXT("strict_mode"), TEXT("boolean"), TEXT("If true, abort with error (no save) when any node fails to resolve"), TEXT("false"))
 			.Build());
@@ -1738,7 +1738,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Export an existing Behavior Tree as a JSON spec (inverse of build_behavior_tree_from_spec)"),
 		FMonolithActionHandler::CreateStatic(&HandleExportBTSpec),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Build());
 
 	// 34. import_bt_spec
@@ -1746,7 +1746,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Recreate a Behavior Tree from an exported spec (overwrites existing tree structure)"),
 		FMonolithActionHandler::CreateStatic(&HandleImportBTSpec),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path (must exist)"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path (must exist)"))
 			.Required(TEXT("spec"), TEXT("object"), TEXT("Full tree spec in export format"))
 			.Build());
 
@@ -1755,7 +1755,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Validate a Behavior Tree: check BB key refs, unreachable branches, empty composites, missing properties"),
 		FMonolithActionHandler::CreateStatic(&HandleValidateBehaviorTree),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Build());
 
 	// 35. clone_bt_subtree
@@ -1763,9 +1763,9 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Copy a subtree from one Behavior Tree to another (deep clone with decorators, services, properties)"),
 		FMonolithActionHandler::CreateStatic(&HandleCloneBTSubtree),
 		FParamSchemaBuilder()
-			.Required(TEXT("source_path"), TEXT("string"), TEXT("Source Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("source_path"), TEXT("Source Behavior Tree asset path"))
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("GUID of the root node of the subtree to copy"))
-			.Required(TEXT("dest_path"), TEXT("string"), TEXT("Destination Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("dest_path"), TEXT("Destination Behavior Tree asset path"))
 			.Optional(TEXT("dest_parent_id"), TEXT("string"), TEXT("GUID of parent node in dest (null = root)"))
 			.Build());
 
@@ -1774,7 +1774,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Auto-layout a Behavior Tree graph. Uses Blueprint Assist formatter if available, else depth/breadth positioning."),
 		FMonolithActionHandler::CreateStatic(&HandleAutoArrangeBT),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("formatter"), TEXT("string"), TEXT("Formatter: default, blueprint_assist, builtin (default tries BA then builtin)"))
 			.Build());
 
@@ -1783,8 +1783,8 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Structural diff between two Behavior Trees: nodes added/removed/moved, property changes"),
 		FMonolithActionHandler::CreateStatic(&HandleCompareBehaviorTrees),
 		FParamSchemaBuilder()
-			.Required(TEXT("path_a"), TEXT("string"), TEXT("First Behavior Tree asset path"))
-			.Required(TEXT("path_b"), TEXT("string"), TEXT("Second Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("path_a"), TEXT("First Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("path_b"), TEXT("Second Behavior Tree asset path"))
 			.Build());
 
 	// 39. create_bt_task_blueprint
@@ -1792,7 +1792,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Create a BTTask Blueprint (parent defaults to BTTaskNode)"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateBTTaskBlueprint),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset save path (e.g. /Game/AI/Tasks/BTTask_MyTask)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset save path (e.g. /Game/AI/Tasks/BTTask_MyTask)"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Blueprint name"))
 			.Optional(TEXT("parent_class"), TEXT("string"), TEXT("Parent class name (default: BTTask_BlueprintBase)"))
 			.Build());
@@ -1802,7 +1802,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Create a BTDecorator Blueprint (parent defaults to BTDecorator_BlueprintBase)"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateBTDecoratorBlueprint),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset save path"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset save path"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Blueprint name"))
 			.Optional(TEXT("parent_class"), TEXT("string"), TEXT("Parent class name (default: BTDecorator_BlueprintBase)"))
 			.Build());
@@ -1812,7 +1812,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Create a BTService Blueprint (parent defaults to BTService_BlueprintBase)"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateBTServiceBlueprint),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset save path"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset save path"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Blueprint name"))
 			.Optional(TEXT("parent_class"), TEXT("string"), TEXT("Parent class name (default: BTService_BlueprintBase)"))
 			.Build());
@@ -1822,7 +1822,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Generate a text diagram of a Behavior Tree (ASCII tree or Mermaid graph)"),
 		FMonolithActionHandler::CreateStatic(&HandleGenerateBTDiagram),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Optional(TEXT("format"), TEXT("string"), TEXT("Output format: ascii (default) or mermaid"))
 			.Build());
 
@@ -1833,7 +1833,7 @@ void FMonolithAIBehaviorTreeActions::RegisterActions(FMonolithToolRegistry& Regi
 		TEXT("Flat node array with parent_id + children GUIDs. Use when you need to look up a node by ID without walking the full tree (vs get_behavior_tree which returns a nested tree)."),
 		FMonolithActionHandler::CreateStatic(&HandleGetBTGraph),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Behavior Tree asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Behavior Tree asset path"))
 			.Build());
 }
 

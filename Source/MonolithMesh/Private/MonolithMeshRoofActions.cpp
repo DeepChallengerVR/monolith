@@ -51,7 +51,7 @@ void FMonolithMeshRoofActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshRoofActions::GenerateRoof),
 		FParamSchemaBuilder()
 			.Required(TEXT("footprint_polygon"), TEXT("array"), TEXT("Array of [x,y] points defining the building outline (CCW winding, cm)"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for the roof mesh (e.g. /Game/CityBlock/Mesh/SM_Roof_01)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for the roof mesh (e.g. /Game/CityBlock/Mesh/SM_Roof_01)"))
 			.Optional(TEXT("roof_type"), TEXT("string"), TEXT("Roof type: gable, hip, flat, shed, gambrel"), TEXT("gable"))
 			.Optional(TEXT("pitch_degrees"), TEXT("number"), TEXT("Roof pitch angle in degrees"), TEXT("30"))
 			.Optional(TEXT("overhang"), TEXT("number"), TEXT("Overhang distance in cm"), TEXT("30"))

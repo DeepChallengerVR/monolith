@@ -54,7 +54,7 @@ void FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("grid"), TEXT("array"), TEXT("2D array of room indices. -1 = empty, -2 = stairwell. E.g. [[0,0,1],[0,0,1],[-1,-1,1]]"))
 			.Required(TEXT("rooms"), TEXT("array"), TEXT("Array of room defs: { room_id, room_type, grid_cells: [[x,y],...] }"))
 			.Required(TEXT("doors"), TEXT("array"), TEXT("Array of door defs: { door_id, room_a, room_b, edge_start: [x,y], edge_end: [x,y], width?, height? }"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path to save building mesh (e.g. /Game/CityBlock/Mesh/SM_Building_01)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path to save building mesh (e.g. /Game/CityBlock/Mesh/SM_Building_01)"))
 			.Optional(TEXT("stairwells"), TEXT("array"), TEXT("Array of stairwell defs: { stairwell_id, grid_cells: [[x,y],...], connects_floor_a, connects_floor_b }"))
 			.Optional(TEXT("floors"), TEXT("array"), TEXT("Array of floor definitions for multi-story. Default: single floor"))
 			.Optional(TEXT("cell_size"), TEXT("number"), TEXT("Grid cell size in cm"), TEXT("50"))

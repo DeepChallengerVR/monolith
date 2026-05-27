@@ -134,7 +134,7 @@ void FMonolithMeshTemplateActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Run a game-readiness checklist on a StaticMesh: collision, LODs, lightmap UV, degenerate geo, material count, pivot, scale. Returns pass/fail per check with severity."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshTemplateActions::ValidateGameReady),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path of the StaticMesh to validate"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Asset path of the StaticMesh to validate"))
 			.Build());
 
 	// 6. suggest_lod_strategy
@@ -142,7 +142,7 @@ void FMonolithMeshTemplateActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Suggest LOD strategy based on triangle count. Returns ready-to-execute params for generate_lods."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshTemplateActions::SuggestLodStrategy),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path of the StaticMesh"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Asset path of the StaticMesh"))
 			.Build());
 
 	// 7. batch_validate
@@ -160,7 +160,7 @@ void FMonolithMeshTemplateActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Compare LOD chain quality: per-step reduction ratio, screen size gaps, section mismatches. Flags unhealthy transitions."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshTemplateActions::CompareLodChain),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path of the StaticMesh"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Asset path of the StaticMesh"))
 			.Build());
 }
 

@@ -272,7 +272,7 @@ void FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry& Reg
 		TEXT("Set per-LOD screen size thresholds on a static mesh asset. Sizes must be monotonically decreasing."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshLevelDesignActions::SetLodScreenSizes),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Static mesh asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Static mesh asset path"))
 			.Required(TEXT("screen_sizes"), TEXT("array"), TEXT("Array of screen size floats per LOD (e.g. [1.0, 0.4, 0.15])"))
 			.Build());
 

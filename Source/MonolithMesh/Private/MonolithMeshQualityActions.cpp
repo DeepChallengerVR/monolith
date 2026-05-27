@@ -81,7 +81,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::GenerateProxyMesh),
 		FParamSchemaBuilder()
 			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Array of actor names to merge"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for saved mesh (e.g. /Game/Merged/MyProxy)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for saved mesh (e.g. /Game/Merged/MyProxy)"))
 			.Optional(TEXT("screen_size"), TEXT("integer"), TEXT("Screen size for proxy (pixels)"), TEXT("300"))
 			.Optional(TEXT("merge_materials"), TEXT("boolean"), TEXT("Merge materials into atlas"), TEXT("true"))
 			.Optional(TEXT("texture_size"), TEXT("integer"), TEXT("Merged material texture size"), TEXT("1024"))
@@ -92,7 +92,7 @@ void FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry& Registr
 		TEXT("Create or configure a UHLODLayer asset with type and settings."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshQualityActions::SetupHlod),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Asset path for HLOD layer (e.g. /Game/HLOD/MyLayer)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path for HLOD layer (e.g. /Game/HLOD/MyLayer)"))
 			.Optional(TEXT("layer_type"), TEXT("string"), TEXT("HLOD type: MeshMerge, MeshSimplify, MeshApproximate, Custom"), TEXT("MeshSimplify"))
 			.Optional(TEXT("cell_size"), TEXT("integer"), TEXT("HLOD cell size in world units"), TEXT("25600"))
 			.Optional(TEXT("loading_range"), TEXT("number"), TEXT("Loading range multiplier"), TEXT("2.0"))

@@ -160,7 +160,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Create a new UNavArea Blueprint with custom cost and color"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateNavArea),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("Package path, e.g. /Game/AI/NavArea_Water"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Package path, e.g. /Game/AI/NavArea_Water"))
 			.Required(TEXT("name"), TEXT("string"), TEXT("Asset name"))
 			.Optional(TEXT("default_cost"), TEXT("number"), TEXT("Default traversal cost (default: 1.0)"))
 			.Optional(TEXT("fixed_area_entering_cost"), TEXT("number"), TEXT("Fixed cost applied once when entering the area (default: 0.0)"))
@@ -270,7 +270,7 @@ void FMonolithAINavigationActions::RegisterActions(FMonolithToolRegistry& Regist
 		TEXT("Add UNavigationInvokerComponent to a Blueprint for dynamic nav generation around the actor"),
 		FMonolithActionHandler::CreateStatic(&HandleAddNavInvokerComponent),
 		FParamSchemaBuilder()
-			.Required(TEXT("blueprint_path"), TEXT("string"), TEXT("Actor Blueprint asset path"))
+			.RequiredAssetPath(TEXT("blueprint_path"), TEXT("Actor Blueprint asset path"))
 			.Optional(TEXT("generation_radius"), TEXT("number"), TEXT("Nav generation radius (cm, default: 3000)"))
 			.Optional(TEXT("removal_radius"), TEXT("number"), TEXT("Nav removal radius (cm, default: 5000)"))
 			.Build());

@@ -107,7 +107,7 @@ void FMonolithGASAttributeActions::RegisterActions(FMonolithToolRegistry& Regist
 		FMonolithActionHandler::CreateStatic(&HandleCreateAttributeInitDataTable),
 		FParamSchemaBuilder()
 			.Required(TEXT("attribute_set"), TEXT("string"), TEXT("AttributeSet class name or asset path"))
-			.Required(TEXT("save_path"), TEXT("string"), TEXT("DataTable asset path (e.g. /Game/GAS/Data/DT_PlayerVitals)"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("DataTable asset path (e.g. /Game/GAS/Data/DT_PlayerVitals)"))
 			.Optional(TEXT("rows"), TEXT("array"), TEXT("Array of {attribute, base_value, min_value?, max_value?} — if omitted, auto-generates from set defaults"))
 			.Build());
 
