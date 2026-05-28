@@ -25,6 +25,12 @@
 #include "CppReflect/FUHTArtefactReader.h"
 #include "CppReflect/FAssetGraphJoiner.h"
 #include "CppReflect/FCppReflectQueryAdapter.h"
+// Phase 4a (v0.17.0) headers — network namespace, audit-action extensions,
+// pipeline composers.
+#include "Network/FNetworkRepIndexer.h"
+#include "Network/FNetworkQueryAdapter.h"
+#include "Audit/FAuditAdapter.h"
+#include "Pipeline/FPipelineAdapter.h"
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
@@ -54,11 +60,12 @@ namespace
 void FMonolithReflectionIntelModule::StartupModule()
 {
 	// Explicit re-arm of the lazy-bootstrap latches on every module load. A
-	// fresh module instance always starts with all three latches cleared so
+	// fresh module instance always starts with all four latches cleared so
 	// that Live Coding reloads re-attempt bootstrap if a prior attempt failed.
 	bDecisionBootstrapAttempted = false;
 	bRiskBootstrapAttempted = false;
 	bCppReflectBootstrapAttempted = false;
+	bNetworkBootstrapAttempted = false;
 
 	RegisterDecisionActions();
 	// Phase 2 (v0.17.0) — risk_query namespace + source_query audit action.
@@ -66,6 +73,11 @@ void FMonolithReflectionIntelModule::StartupModule()
 	RegisterSourceAuditActions();
 	// Phase 3a (v0.17.0) — cppreflect_query namespace (5 actions).
 	RegisterCppReflectActions();
+	// Phase 4a (v0.17.0) — network_query namespace (4 actions) + 4 audit
+	// actions on existing namespaces + pipeline_query namespace (2 composers).
+	RegisterNetworkActions();
+	RegisterAuditActions();
+	RegisterPipelineActions();
 
 	// Bind hot-reload hook so the decision corpus refreshes after Live Coding /
 	// UBT rebuilds. The handler opens the DB ReadWrite only briefly (the
@@ -87,7 +99,9 @@ void FMonolithReflectionIntelModule::StartupModule()
 	UE_LOG(LogMonolithReflectionIntel, Log,
 		TEXT("Monolith — ReflectionIntel module loaded (decision_query: 5 actions, "
 		     "risk_query: 5 actions, source_query: +1 audit action, "
-		     "cppreflect_query: 5 actions)"));
+		     "cppreflect_query: 5 actions, network_query: 4 actions, "
+		     "material/niagara/blueprint/project: +1 audit each, "
+		     "pipeline_query: 2 composers)"));
 }
 
 void FMonolithReflectionIntelModule::ShutdownModule()
@@ -111,12 +125,19 @@ void FMonolithReflectionIntelModule::ShutdownModule()
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("risk"));
 	// Phase 3a — cppreflect_query is fully owned by this module.
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("cppreflect"));
-	// NOTE: we do NOT unregister the `source` namespace here — MonolithSource
-	// owns the lion's share of source_query actions. Our one audit action
-	// would also be unregistered with the namespace-wide call. The risk is
-	// minimal: Phase 2 ships with MonolithSource loaded before us (the
-	// `MonolithCore` dep chain enforces order) so shutdown-time leaks are
-	// bounded to a single action entry per process exit.
+	// Phase 4a — network_query is fully owned by this module.
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("network"));
+	// Phase 4a — pipeline_query is fully owned by this module (no other
+	// module registers there in Phase 4a).
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("pipeline"));
+	// NOTE: we do NOT unregister the `source` / `material` / `niagara` /
+	// `blueprint` / `project` namespaces here — MonolithSource / MonolithMaterial
+	// / MonolithNiagara / MonolithBlueprint / MonolithIndex own the lion's share
+	// of those namespaces' actions. Our audit-action additions would also be
+	// unregistered with a namespace-wide call. The risk is minimal: Phase 4a
+	// ships with those modules loaded before us (the `MonolithCore` dep chain
+	// enforces order) so shutdown-time leaks are bounded to one audit action
+	// entry per host namespace per process exit.
 }
 
 FSQLiteDatabase* FMonolithReflectionIntelModule::GetOrOpenCachedQueryDb()
@@ -187,6 +208,21 @@ void FMonolithReflectionIntelModule::RegisterCppReflectActions()
 	FCppReflectQueryAdapter::RegisterActions(FMonolithToolRegistry::Get());
 }
 
+void FMonolithReflectionIntelModule::RegisterNetworkActions()
+{
+	FNetworkQueryAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
+void FMonolithReflectionIntelModule::RegisterAuditActions()
+{
+	FAuditAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
+void FMonolithReflectionIntelModule::RegisterPipelineActions()
+{
+	FPipelineAdapter::RegisterActions(FMonolithToolRegistry::Get());
+}
+
 void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Reason*/)
 {
 	// Fire-and-log; never block the reload signal. Failure to refresh the
@@ -206,6 +242,12 @@ void FMonolithReflectionIntelModule::OnReloadComplete(EReloadCompleteReason /*Re
 	// edges may be stale". Refresh after every reload.
 	FString CppReflectStatus;
 	RunCppReflectIndexersOnce(CppReflectStatus);
+
+	// Phase 4a — network rep metadata lives in the same UHT artefacts; rebuild
+	// after reload so audit_unbalanced_onreps stays current. Audit actions
+	// themselves are pure SQL/AR queries and don't need bootstrap.
+	FString NetworkStatus;
+	RunNetworkIndexerOnce(NetworkStatus);
 }
 
 bool FMonolithReflectionIntelModule::RunDecisionIndexerOnce(FString& OutStatus)
@@ -418,6 +460,65 @@ bool FMonolithReflectionIntelModule::RunCppReflectIndexersOnce(FString& OutStatu
 		*UhtStatus, *JoinerStatus);
 	UE_LOG(LogMonolithReflectionIntel, Log, TEXT("%s"), *OutStatus);
 	return bUhtOk && bJoinerOk;
+}
+
+bool FMonolithReflectionIntelModule::RunNetworkIndexerOnce(FString& OutStatus)
+{
+	// No settings gate in Phase 4a — the network indexer's UHT-artefact reader
+	// is cheap when no artefacts exist on disk (graceful "0 rows" return). A
+	// settings toggle (bEnableNetworkReplicationAudit) controls behaviour at
+	// the registration layer in a future ergonomics pass; Phase 4a unconditionally
+	// runs the indexer here so the action surface stays consistent across
+	// build configurations.
+
+	const FString DbPath = GetEngineSourceDbPathStatic();
+	IPlatformFile& Pf = FPlatformFileManager::Get().GetPlatformFile();
+	if (!Pf.FileExists(*DbPath))
+	{
+		OutStatus = FString::Printf(
+			TEXT("RunNetworkIndexerOnce: EngineSource.db not present at '%s' — bootstrap with source.trigger_reindex"),
+			*DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Verbose, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	FSQLiteDatabase Db;
+	if (!Db.Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
+	{
+		OutStatus = FString::Printf(TEXT("RunNetworkIndexerOnce: failed to open '%s'"), *DbPath);
+		UE_LOG(LogMonolithReflectionIntel, Warning, TEXT("%s"), *OutStatus);
+		return false;
+	}
+
+	// Same DELETE-journal discipline as Phase 1/2/3a — opening a second RW
+	// handle on a SQLite DB the source subsystem may have left in WAL mode is
+	// the documented silent-failure pattern on Windows.
+	if (!Db.Execute(TEXT("PRAGMA journal_mode=DELETE;")))
+	{
+		UE_LOG(LogMonolithReflectionIntel, Warning,
+			TEXT("RunNetworkIndexerOnce: PRAGMA journal_mode=DELETE failed on '%s' (continuing)"),
+			*DbPath);
+	}
+
+	// Resolve UHT artefact roots from settings — same shape as the Phase 3a
+	// cppreflect runner. Empty = auto-resolve to ProjectIntermediateDir/Build
+	// inside FNetworkRepIndexer::Run.
+	const UMonolithReflectionIntelSettings* Settings = UMonolithReflectionIntelSettings::Get();
+	TArray<FString> ArtefactRoots;
+	bool bIncludeEnginePlugins = false;
+	if (Settings)
+	{
+		bIncludeEnginePlugins = Settings->bIndexEnginePluginReflection;
+		if (!Settings->UHTArtefactRoot.IsEmpty())
+		{
+			ArtefactRoots.Add(Settings->UHTArtefactRoot);
+		}
+	}
+
+	FNetworkRepIndexer Indexer;
+	const bool bOk = Indexer.Run(Db, ArtefactRoots, bIncludeEnginePlugins, OutStatus);
+	Db.Close();
+	return bOk;
 }
 
 #undef LOCTEXT_NAMESPACE

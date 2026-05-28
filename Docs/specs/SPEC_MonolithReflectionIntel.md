@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.17.0 — 16 actions shipped across Phases 1–3a (5 decision + 5 risk + 1 source-namespace module-dep audit + 5 cppreflect)
+**Version:** 0.17.0 — 26 actions shipped across Phases 1–4a (5 decision + 5 risk + 1 source-namespace module-dep audit + 5 cppreflect + 4 network + 2 pipeline + 4 audit actions on existing namespaces: material/niagara/blueprint/project)
 
 ---
 
@@ -10,7 +10,7 @@
 
 `MonolithReflectionIntel` is a deterministic, $0-LLM intelligence layer that mines high-signal facts out of the project's own artefacts (markdown, git history, C++, AssetRegistry) and exposes them as MCP query actions. It exists to give AI agents structured answers to questions the project itself already knows the answer to — without spending tokens re-deriving them from raw source.
 
-Phases 1, 2, and 3a fold into the same v0.17.0 release. Phase 1 ships the **Decision Intelligence** slice — architectural decision records mined from the project's markdown corpora (specs, plans, CHANGELOG, `.claude/rules/`) and served through the `decision_query` namespace (5 actions). Phase 2 ships the **Risk Intelligence** slice — git-log mining + conditional-gate inventory served through a new `risk_query` namespace (5 actions), plus a **Module-Dep Reality Audit** that registers a single audit action onto the existing `source_query` namespace. Phase 3a ships the **CppReflect Intelligence** slice — UE 5.7 reflection-edge queries served through a new `cppreflect_query` namespace (5 actions), driven by direct reads of UHT artefacts (`Intermediate/Build/.../UHT/*.gen.cpp`) cross-joined with `IAssetRegistry`. Phase 3b (tree-sitter integration for native gameplay-tag declaration tracking) is deferred. Phase 4 is planned but not yet implemented.
+Phases 1, 2, 3a, and 4a fold into the same v0.17.0 release. Phase 1 ships the **Decision Intelligence** slice — architectural decision records mined from the project's markdown corpora (specs, plans, CHANGELOG, `.claude/rules/`) and served through the `decision_query` namespace (5 actions). Phase 2 ships the **Risk Intelligence** slice — git-log mining + conditional-gate inventory served through a new `risk_query` namespace (5 actions), plus a **Module-Dep Reality Audit** that registers a single audit action onto the existing `source_query` namespace. Phase 3a ships the **CppReflect Intelligence** slice — UE 5.7 reflection-edge queries served through a new `cppreflect_query` namespace (5 actions), driven by direct reads of UHT artefacts (`Intermediate/Build/.../UHT/*.gen.cpp`) cross-joined with `IAssetRegistry`. Phase 4a ships the **Network Intelligence** slice — replication inspection served through a new `network_query` namespace (4 actions), the **Pipeline Composers** slice — PR-review + release-readiness composers served through a new `pipeline_query` namespace (2 actions), and 4 read-only audit actions registered onto the existing `material` / `niagara` / `blueprint` / `project` namespaces. Phase 3b (tree-sitter integration for native gameplay-tag declaration tracking) and Phase 4b (gas_query tag-graph audits + animation_query thread-safety audit + bare `UPROPERTY(Replicated)` detection) are deferred — both depend on tree-sitter substrate landing.
 
 ### Roadmap
 
@@ -20,9 +20,10 @@ Phases 1, 2, and 3a fold into the same v0.17.0 release. Phase 1 ships the **Deci
 | 2 — Risk Intelligence | **shipped v0.17.0** | `risk_query` (5 actions) + `source_query("audit_module_dep_reality")` (1 audit action) | Git log subprocess + LOC sweep + regex over `#if WITH_*` / `bHas*` + Build.cs parsing against `EngineSource.db` symbol resolution |
 | 3a — CppReflect Intelligence | **shipped v0.17.0** | `cppreflect_query` (5 actions) + cpp↔asset edges | UHT artefact regex sweep over `Intermediate/Build/.../UHT/*.gen.cpp` + `IAssetRegistry` asset-graph joiner — NO tree-sitter dependency |
 | 3b — Native Tag Tracking | `(WISHLIST)` | `cppreflect_query("list_native_tags")` (1 action) + 2 tag tables | tree-sitter-unreal-cpp on `.cpp` / `.h` for native `UE_DEFINE_GAMEPLAY_TAG_*` / `extern FGameplayTag` mining |
-| 4 — Network Intelligence | `(WISHLIST)` | `network_query` + audit actions + `pipeline_query("pr_review")` composer | Composes Phases 1+2+3a |
+| 4a — Network Intelligence + Audits + Pipelines | **shipped v0.17.0** | `network_query` (4 actions) + `pipeline_query` (2 actions) + `material_query("audit_orphan_materials")` + `niagara_query("audit_cross_asset_refs")` + `blueprint_query("audit_cdo_drift")` + `project_query("audit_orphan_assets")` + `reflect_replicated_properties` SQLite table | Second UHT-artefact sweep (independent of Phase 3a's reader) for per-property `MetaData` blocks carrying `ReplicatedUsing` tags; composed reads against Phases 1/2/3a tables + `IAssetRegistry` for the 4 cross-namespace audits; composer reads-only |
+| 4b — Tag-graph + thread-safety audits + bare-Replicated detection | `(WISHLIST)` | `gas_query("find_tag_consumers" / "find_grant_paths" / "find_revoke_paths")` + `animation_query("audit_thread_safety")` + Phase 4a bare `UPROPERTY(Replicated)` (no rep notify) detection | All three need Phase 3b's tree-sitter substrate: gas tag-graph queries depend on native-tag tracking; animation thread-safety audit depends on Phase 3b specifier population; bare-Replicated detection requires the `PropPointers[]` parse Phase 4a does not yet do |
 
-The phases are independent (Phase 2 does not depend on Phase 1; Phase 3a does not depend on Phase 2; Phase 4 depends on Phase 3a reflection-edge tables for `network_query` and the audit actions). Phases 1 + 2 + 3a co-shipped in v0.17.0. Phase 3b is deferred — the deferral rationale is in §5b below.
+The phases are independent (Phase 2 does not depend on Phase 1; Phase 3a does not depend on Phase 2; Phase 4a depends on Phase 3a reflection-edge tables for `network_query` and on the Phase 1+2+3a substrate for the pipeline composers). Phases 1 + 2 + 3a + 4a co-shipped in v0.17.0. Phases 3b and 4b are deferred — both depend on tree-sitter substrate; rationales in §5b and §9 below.
 
 ---
 
@@ -30,9 +31,9 @@ The phases are independent (Phase 2 does not depend on Phase 1; Phase 3a does no
 
 **Type:** `Editor`
 **Loading phase:** `Default`
-**Public namespaces owned by this module:** `decision` (5 actions, Phase 1) + `risk` (5 actions, Phase 2) + `cppreflect` (5 actions, Phase 3a). Phase 2 additionally registers one audit action onto the **existing** `source` namespace owned by `MonolithSource` (`source_query("audit_module_dep_reality")`); the audit handler lives in `MonolithReflectionIntel` but is registered against the source dispatcher for caller ergonomics — agents already discover `source_query` first.
+**Public namespaces owned by this module:** `decision` (5 actions, Phase 1) + `risk` (5 actions, Phase 2) + `cppreflect` (5 actions, Phase 3a) + `network` (4 actions, Phase 4a) + `pipeline` (2 actions, Phase 4a). Phase 2 additionally registers one audit action onto the **existing** `source` namespace owned by `MonolithSource` (`source_query("audit_module_dep_reality")`). Phase 4a additionally registers four audit actions onto **existing** host namespaces — `material_query("audit_orphan_materials")`, `niagara_query("audit_cross_asset_refs")`, `blueprint_query("audit_cdo_drift")`, `project_query("audit_orphan_assets")`. All cross-namespace audit handlers live in `MonolithReflectionIntel` but register against their host dispatchers for caller ergonomics — agents already discover `material_query` / `niagara_query` / `blueprint_query` / `project_query` / `source_query` first.
 
-`MonolithReflectionIntel` is a self-contained editor module. Phase 1 owns one indexer worker (`FDecisionRecordIndexer`), one query adapter (`FDecisionQueryAdapter`), one settings UCLASS (`UMonolithReflectionIntelSettings`), and a SQLite schema fragment (`MonolithDecisionSchema` namespace). Phase 2 adds three indexer workers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`), two query adapters (`FRiskQueryAdapter`, `FModuleDepRealityAdapter`), and a second SQLite schema fragment (`MonolithRiskSchema` namespace) sharing `EngineSource.db`. Phase 3a adds one indexer worker (`FCppReflectIndexer` — UHT-artefact regex sweep + `IAssetRegistry` asset-graph joiner), one query adapter (`FCppReflectQueryAdapter`), and a third SQLite schema fragment (`MonolithCppReflectSchema` namespace) sharing the same `EngineSource.db`.
+`MonolithReflectionIntel` is a self-contained editor module. Phase 1 owns one indexer worker (`FDecisionRecordIndexer`), one query adapter (`FDecisionQueryAdapter`), one settings UCLASS (`UMonolithReflectionIntelSettings`), and a SQLite schema fragment (`MonolithDecisionSchema` namespace). Phase 2 adds three indexer workers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`), two query adapters (`FRiskQueryAdapter`, `FModuleDepRealityAdapter`), and a second SQLite schema fragment (`MonolithRiskSchema` namespace) sharing `EngineSource.db`. Phase 3a adds one indexer worker (`FCppReflectIndexer` — UHT-artefact regex sweep + `IAssetRegistry` asset-graph joiner), one query adapter (`FCppReflectQueryAdapter`), and a third SQLite schema fragment (`MonolithCppReflectSchema` namespace) sharing the same `EngineSource.db`. Phase 4a adds one indexer worker (`FNetworkIndexer` — second UHT-artefact sweep over per-property `MetaData` blocks), two query adapters (`FNetworkQueryAdapter`, `FPipelineQueryAdapter`), four cross-namespace audit handlers registered against `material` / `niagara` / `blueprint` / `project` host adapters, and a fourth SQLite schema fragment (`MonolithNetworkSchema` namespace) sharing the same `EngineSource.db`.
 
 ### Lazy bootstrap
 
@@ -341,7 +342,7 @@ The conditional-gate inventory is built by regex sweep against three patterns:
 | `bool\s+bHas(\w+)\s*=` | `.Build.cs` | 3-location detection probe variables (e.g. `bHasGameplayAbilities`, `bHasCommonUI`) |
 | `MONOLITH_RELEASE_BUILD` | `.Build.cs` | Release-build bypass branches |
 
-For each match the indexer records the module, the gate name, the file path, the source line, and (for `bHas*` probes) the surrounding probe block's classification (3-location, 4-location, or release-bypass). The output table `reflect_conditional_gates` is the substrate for `risk_query("list_conditional_gates")` and is also intended to feed Phase 4's `network_query` audits.
+For each match the indexer records the module, the gate name, the file path, the source line, and (for `bHas*` probes) the surrounding probe block's classification (3-location, 4-location, or release-bypass). The output table `reflect_conditional_gates` is the substrate for `risk_query("list_conditional_gates")` and is also consumed by the Phase 4a pipeline composer's release-readiness audit.
 
 Regex-based detection is intentionally cheap. Phase 3 may swap to tree-sitter for higher fidelity (catching commented-out `#if WITH_*` blocks, multi-line conditions, etc.); v0.17.0 accepts the false-positive rate for the indexer-runtime budget.
 
@@ -797,24 +798,263 @@ Phase 3b would add native gameplay-tag declaration tracking on top of the Phase 
 
 ---
 
-## 6. Network Intelligence (Phase 4 — WISHLIST)
+## 6. Network Intelligence (Phase 4a — SHIPPED v0.17.0)
 
-**Planned namespace:** `network_query` + seven audit actions across `material_query` / `niagara_query` / `animation_query` / `source_query` + `pipeline_query("release_readiness")` + `pipeline_query("pr_review")` composers.
+### 6.1 Purpose
 
-**Substrate:** Phases 1 + 2 + 3a composed — decision corpus + risk scores + reflection edges. Phase 3b's native-tag tables would extend the substrate further if it ships.
+The network slice answers the four highest-frequency replication-edge questions an agent asks while reviewing UE 5.7 multiplayer code:
 
-**Planned action surface (illustrative):**
+- **"Which UCLASSes declare replicated state?"** — `list_replicated_classes` enumerates every UCLASS that carries at least one `UPROPERTY` with `ReplicatedUsing` set, sortable by replicated-property count.
+- **"Which UFUNCTIONs are RPCs of a given kind?"** — `list_rpc_functions` filters the Phase 3a `reflect_ufunctions` table by name-prefix convention (`Server_*`, `Client_*`, `Multicast_*`, `NetMulticast_*`) for the common project-side RPC discipline.
+- **"Which OnRep handlers exist?"** — `list_onrep_handlers` returns every UFUNCTION named `OnRep_*` paired with the property it covers (resolved via name-suffix match against `reflect_replicated_properties.rep_notify_func`).
+- **"Which `ReplicatedUsing=` declarations point at OnRep handlers that don't exist?"** — `audit_unbalanced_onreps` is the consistency check that catches typos and rename drift between the property declaration and the handler definition.
 
-- `network_query("audit_replicated_properties", module_filter)` — project-wide replication audit.
-- `material_query("audit_orphan_materials", path_prefix)` — materials with no usage edges in the asset graph.
-- `niagara_query("audit_orphan_emitters", path_prefix)` — emitters with no system parents.
-- `animation_query("audit_thread_safety", anim_bp)` — AnimBP math nodes touched from `BlueprintThreadSafeUpdateAnimation`.
-- `pipeline_query("pr_review", changed_files[])` — composer bundling `risk_query("get_hotspot_score")` + `risk_query("get_cochange_pairs")` + `decision_query` lookups + `source_query("audit_module_dep_reality")` + `cppreflect_query("get_uclass" / "list_uproperties" / "list_ufunctions")` into a single PR-review payload. **Deferred to Phase 4** — composer-side validation now has the Phase 3a cppreflect tables available to ground type-impact predictions; the remaining gate is the per-domain audit-action design (`material_query("audit_orphan_materials")` et al.).
-- `pipeline_query("release_readiness")` — bundles all audits + Phase 1 / 2 / 3a reads into a single release-gate payload.
+All four actions are read-only. The substrate is a second UHT-artefact regex sweep (independent of Phase 3a's `FUHTArtefactReader` for separation of concerns) focused on per-property `MetaData` blocks. Cross-joins are against `reflect_ufunctions` from Phase 3a, so Phase 4a depends on Phase 3a's reflection-edge tables being populated.
+
+### 6.2 Substrate
+
+| Substrate | Mining method | Output |
+|-----------|---------------|--------|
+| UHT artefacts (replication sweep) | Second regex sweep over the same `Intermediate/Build/Win64/.../Inc/<Module>/UHT/*.gen.cpp` files Phase 3a reads, focused on per-property `MetaData` blocks carrying `ReplicatedUsing` tags | Per-property replication record: declaring class, property, `rep_kind` ('rep_notify' in Phase 4a), `rep_notify_func` |
+
+The reader is intentionally a second sweep rather than an extension of Phase 3a's `FUHTArtefactReader` — the per-property metadata-block parse path is distinct from the property-declaration parse path Phase 3a walks, and the separation keeps the two indexers individually testable and individually swappable when the UE 5.x UHT emission format drifts.
+
+### 6.3 SQLite schema
+
+One new table lives inside the shared `EngineSource.db` file under the `reflect_` prefix so it coexists with the Phase 3a `reflect_*` tables.
+
+```sql
+CREATE TABLE IF NOT EXISTS reflect_replicated_properties (
+    class_name       TEXT NOT NULL,
+    module_name      TEXT NOT NULL,
+    property_name    TEXT NOT NULL,
+    rep_kind         TEXT NOT NULL,            -- 'rep_notify' (Phase 4a) — 'bare_replicated' deferred to Phase 4b
+    rep_notify_func  TEXT,                     -- the OnRep_* handler name from ReplicatedUsing=
+    source_path      TEXT NOT NULL,            -- UHT ModuleRelativePath, same convention as Phase 3a
+    source_line      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (class_name, module_name, property_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reflect_replicated_properties_class
+    ON reflect_replicated_properties(class_name, module_name);
+CREATE INDEX IF NOT EXISTS idx_reflect_replicated_properties_repnotify
+    ON reflect_replicated_properties(rep_notify_func);
+```
+
+Follows Phase 1 wipe-and-rewrite semantics — `Run()` truncates and rewrites inside a single `BEGIN TRANSACTION ... COMMIT` block. DDL canonical source: `Plugins/Monolith/Source/MonolithReflectionIntel/Private/NetworkSchema.cpp`.
+
+### 6.4 Action surface
+
+Four actions register under `network` from `FNetworkQueryAdapter::RegisterActions`. All four carry `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` on the dispatcher annotations. All four participate in v0.17.0 universal response shaping (`_fields` / `_omit` / `_compact_json`).
+
+#### `network_query("list_replicated_classes", params)`
+
+Enumerate UCLASSes carrying at least one `ReplicatedUsing` property. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `module_filter` | string | `Other` | no | `""` | Substring match against `module_name`. |
+| `limit` | integer | `Other` | no | `50` | Hard cap `200`. |
+| `cursor` | string | `Other` | no | `""` | Opaque base64+JSON cursor. |
+
+**Response:** `{ "classes": [ { "class_name", "module_name", "replicated_property_count" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. Sorted by `replicated_property_count DESC, class_name ASC`.
+
+#### `network_query("list_rpc_functions", params)`
+
+Filter `reflect_ufunctions` by name-prefix convention to surface the project's RPC surface. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `rpc_kind` | string | `Other` | no | `""` | Exact match — `server`, `client`, `multicast`, `netmulticast`. Empty returns all four. |
+| `class_name` | string | `Other` | no | `""` | Optional UCLASS filter. |
+| `module_filter` | string | `Other` | no | `""` | Substring match against module name. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Response:** `{ "rpcs": [ { "class_name", "module_name", "function_name", "rpc_kind", "function_flags", "return_type", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `rpc_kind` is derived from name prefix at query time (no schema column needed since Phase 3a stores the canonical function name).
+
+#### `network_query("list_onrep_handlers", params)`
+
+List every `OnRep_*` UFUNCTION paired with the property it covers. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `class_name` | string | `Other` | no | `""` | Optional UCLASS filter. |
+| `module_filter` | string | `Other` | no | `""` | Substring match. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Response:** `{ "handlers": [ { "class_name", "module_name", "function_name", "covered_property", "source_path", "source_line" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. `covered_property` is resolved by joining `reflect_replicated_properties.rep_notify_func == function_name`; if no match is found the field is empty (handler is orphaned — the inverse of `audit_unbalanced_onreps`).
+
+#### `network_query("audit_unbalanced_onreps", params)`
+
+Find `ReplicatedUsing=OnRep_X` declarations whose `OnRep_X` function does NOT exist in the same class's reflected UFUNCTION surface. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `module_filter` | string | `Other` | no | `""` | Substring match. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Response:** `{ "violations": [ { "class_name", "module_name", "property_name", "missing_handler" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. Sorted by `(module_name, class_name, property_name)` so multi-row violations within a single class clump together.
+
+### 6.5 Known limitations
+
+- **Bare `UPROPERTY(Replicated)` (no rep notify) not detected in Phase 4a.** The signal lives in UHT's `PropPointers[]` emission block, which Phase 4a's second sweep does not parse — Phase 4a only walks per-property `MetaData` blocks. Properties using `Replicated` without `ReplicatedUsing` are invisible to `list_replicated_classes` and `audit_unbalanced_onreps`. This is a Phase 4b enhancement.
+- **Multi-condition replication (`COND_*`) not surfaced.** Phase 4a's `rep_kind` column only carries `'rep_notify'`. Replication-condition gating (`COND_OwnerOnly`, `COND_SkipOwner`, etc.) is parsed by UHT but not yet read by the Phase 4a sweep.
+- **RPC kind derived from name convention only.** `list_rpc_functions` filters on the prefix substring of `function_name` (`Server_`, `Client_`, `Multicast_`, `NetMulticast_`). The canonical signal — `EFunctionFlags::FUNC_NetServer` / `FUNC_NetClient` / `FUNC_NetMulticast` — is already in `reflect_ufunctions.function_flags`, but the name-prefix path is cheaper and matches project convention. Callers needing flag-level fidelity should query `cppreflect_query("list_ufunctions")` directly and mask `function_flags` themselves.
 
 ---
 
-## 7. Dependencies
+## 7. Audit Actions on Existing Namespaces (Phase 4a — SHIPPED v0.17.0)
+
+Four read-only audit actions register against existing host namespaces. Each is registered through the host namespace's adapter (so the existing namespace-level dispatcher annotations apply) but the handler lives inside `MonolithReflectionIntel`.
+
+### 7.1 `material_query("audit_orphan_materials")`
+
+Identify materials with zero inbound references in the asset graph — typical orphans from deleted Blueprint owners or refactored material chains. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `path_prefix` | string | `AssetPath` | no | `"/Game/"` | `/Game/...` path prefix to scope the scan. Dispatcher rewrites `\` → `/` with a surfaced warning. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Algorithm:** walk every `UMaterial` / `UMaterialInstance` under `path_prefix` via `IAssetRegistry::GetAssetsByPath`; for each, query `IAssetRegistry::GetReferencers` and emit a row when the returned referencer set is empty. Skip the engine and project transient packages.
+
+**Response:** `{ "orphans": [ { "asset_path", "asset_class" } ], "total_estimate": N, "next_cursor": "<opaque>" }`.
+
+Dispatcher annotations: inherits `material_query`'s namespace annotations. The action itself is read-only + idempotent.
+
+### 7.2 `niagara_query("audit_cross_asset_refs")`
+
+Find broken or stale asset references inside Niagara systems / emitters — referenced assets that no longer exist (deleted, renamed, moved out of `/Game/`) or whose class has shifted. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `path_prefix` | string | `AssetPath` | no | `"/Game/"` | `/Game/...` path prefix to scope the scan. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Algorithm:** for every `UNiagaraSystem` / `UNiagaraEmitter` under `path_prefix`, walk Phase 3a's `cpp_asset_edges` table joined against `IAssetRegistry::GetAssetByObjectPath`; emit a row for each `asset_path` whose target asset is not loadable or whose registry record's class no longer matches the stored `cpp_class`.
+
+**Response:** `{ "broken_refs": [ { "owning_asset", "missing_or_stale_ref", "expected_class", "actual_class_or_null" } ], "total_estimate": N, "next_cursor": "<opaque>" }`.
+
+Dispatcher annotations: inherits `niagara_query`'s namespace annotations.
+
+### 7.3 `blueprint_query("audit_cdo_drift")`
+
+Detect Blueprint child classes whose CDO has overridden a native C++ parent's default value — useful when a native default changes upstream and BP children silently keep the stale override. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `path_prefix` | string | `AssetPath` | no | `"/Game/"` | `/Game/...` path prefix to scope the scan. |
+| `class_filter` | string | `Other` | no | `""` | Substring match against the parent C++ class name. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Algorithm:** for every `UBlueprint` under `path_prefix` whose `ParentClass` is a native (non-BP) UCLASS, walk the CDO's `UProperty` set comparing the BP CDO's current value to the parent native CDO's stored default; emit a row per drifted property.
+
+**Response:** `{ "drifts": [ { "bp_asset_path", "parent_class", "property_name", "parent_default", "bp_override" } ], "total_estimate": N, "next_cursor": "<opaque>" }`. Sorted by `(bp_asset_path, property_name)` so multi-drift BPs clump together.
+
+Dispatcher annotations: inherits `blueprint_query`'s namespace annotations.
+
+### 7.4 `project_query("audit_orphan_assets")`
+
+Project-wide zero-reference scan across all asset classes — `material_query("audit_orphan_materials")` is the type-scoped sibling; this is the general form. Cursor-paginated.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `path_prefix` | string | `AssetPath` | no | `"/Game/"` | `/Game/...` path prefix to scope the scan. |
+| `asset_class_filter` | string | `Other` | no | `""` | Substring match against asset class name. |
+| `limit` | integer | `Other` | no | `100` | Hard cap `500`. |
+| `cursor` | string | `Other` | no | `""` | Opaque cursor. |
+
+**Algorithm:** `IAssetRegistry::GetAssetsByPath` walk + `GetReferencers` per asset (cross-validated against Phase 3a's `cpp_asset_edges` to surface assets referenced only from C++ but not from BP/asset graph). An asset is orphaned only when both reference sets are empty.
+
+**Response:** `{ "orphans": [ { "asset_path", "asset_class" } ], "total_estimate": N, "next_cursor": "<opaque>" }`.
+
+Dispatcher annotations: inherits `project_query`'s namespace annotations.
+
+---
+
+## 8. Pipeline Composers (Phase 4a — SHIPPED v0.17.0)
+
+Two read-only composer actions register under a new `pipeline` namespace from `FPipelineQueryAdapter::RegisterActions`. Both carry `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true` on the dispatcher annotations. Both participate in v0.17.0 universal response shaping.
+
+Composers fan out other registered actions serially on the game thread and assemble the results into a single JSON payload. They never mutate state — every action they invoke is itself `readOnlyHint: true`.
+
+### 8.1 `pipeline_query("pr_review", params)`
+
+Bundle the most common PR-review reads into a single call against a list of changed files. Inputs are project-relative paths (typically the output of `git diff --name-only`).
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `changed_files` | `string[]` | `DiskPath` | yes | — | Array of project-relative paths. Hard cap 100 paths per call. |
+| `include_drift` | bool | `Other` | no | `true` | Include CDO drift check (Phase 4a action 7.3). |
+
+**Algorithm:** for each path in `changed_files` the composer issues `risk_query("get_hotspot_score")`, `risk_query("get_cochange_pairs")`, `decision_query("list_decisions", path_filter=path)`, `source_query("audit_module_dep_reality", module_filter=<derived>)`, and (when `include_drift` is true) `blueprint_query("audit_cdo_drift", path_prefix=<derived>)`. Results are aggregated per-path.
+
+**Response:**
+
+```json
+{
+  "files": [
+    {
+      "path": "Plugins/Monolith/Source/.../Foo.cpp",
+      "hotspot_score": 0.81,
+      "cochange_partners": [ /* top-5 partners */ ],
+      "decisions": [ /* matching decision rows */ ],
+      "module_dep_violations": [ /* if any */ ],
+      "cdo_drifts": [ /* if include_drift true and BPs derive from this module */ ]
+    }
+  ],
+  "summary": {
+    "files_above_hotspot_threshold": 3,
+    "total_decisions_touched": 7,
+    "violation_count": 0
+  }
+}
+```
+
+### 8.2 `pipeline_query("release_readiness", params)`
+
+Release-gate composer — bundles the signals a release-readiness check needs into a single payload. No required params.
+
+| Param | Type | EMonolithParamKind | Required | Default | Notes |
+|-------|------|---------------------|----------|---------|-------|
+| `stale_decision_days` | integer | `Other` | no | `90` | Forwarded to `decision_query("list_stale")`. |
+| `hotspot_threshold` | number | `Other` | no | `0.7` | Forwarded to `risk_query("get_release_window_hotspots")`. |
+
+**Algorithm:** composer issues `monolith_status()`, `decision_query("list_stale")`, `risk_query("get_release_window_hotspots")`, and (in-process Monolith-only signals) the sentinel-list audit + CHANGELOG completeness audit specced in `.claude/rules/scoped/monolith-release.md`. Read-only end-to-end.
+
+**Response:**
+
+```json
+{
+  "status": { /* monolith_status payload */ },
+  "stale_decisions": [ /* list_stale rows */ ],
+  "release_window_hotspots": [ /* hotspot rows */ ],
+  "sentinel_audit": { /* sentinel-list check result */ },
+  "changelog_completeness": { /* commit-vs-CHANGELOG diff summary */ }
+}
+```
+
+---
+
+## 9. Phase 4b — Tag Graph + Thread-Safety Audits + Bare-Replicated Detection (WISHLIST)
+
+Phase 4b would add three audit families on top of the Phase 4a + Phase 3b substrate:
+
+- **`gas_query("find_tag_consumers" / "find_grant_paths" / "find_revoke_paths")`** — full GameplayTag dependency graph: every UFUNCTION / UPROPERTY that consumes a tag, every code path that grants the tag via `GiveAbility` / `AddLooseGameplayTag`, every revoke path. Requires Phase 3b's native-tag declaration tracking — without `reflect_native_tag_decls` populated, the audit cannot resolve native-side tag references.
+- **`animation_query("audit_thread_safety")`** — for each AnimBP, validate that every math node touched from `BlueprintThreadSafeUpdateAnimation` carries the `BlueprintThreadSafe` meta tag. Requires Phase 3b's `reflect_uproperties.specifiers` population — Phase 4a-coarse empty-string fields make the check impossible.
+- **Phase 4a bare `UPROPERTY(Replicated)` (no rep notify) detection** — properties using the `Replicated` specifier without `ReplicatedUsing` are invisible to Phase 4a's metadata-block sweep. The signal lives in UHT's `PropPointers[]` emission block, which Phase 4a's reader does not parse. Phase 4b would either add a third UHT sweep targeting `PropPointers[]` or migrate Phase 4a to a tree-sitter substrate.
+
+**Deferral rationale.** All three are blocked on Phase 3b's tree-sitter substrate landing — see §5b for the tree-sitter vendoring cost / benefit analysis. The combined value of "tag dependency graph + thread-safety audit + complete replication audit" is real but not blocking the Steam-build readiness work Phase 4a directly addresses.
+
+---
+
+## 11. Dependencies
 
 `Plugins/Monolith/Source/MonolithReflectionIntel/MonolithReflectionIntel.Build.cs`:
 
@@ -829,13 +1069,15 @@ Phase 3b would add native gameplay-tag declaration tracking on top of the Phase 
 
 **Phase 3a adds one dep: `AssetRegistry`.** The Phase 3a cppreflect indexer joins the UHT class graph against `IAssetRegistry::Get().GetDependencies` to populate `cpp_asset_edges`. The UHT artefact reader itself uses only `Core` (`FRegexPattern`, `FFileHelper`, `IFileManager`) — no new dep needed there. `AssetRegistry` is the only Phase 3a addition to `PrivateDependencyModuleNames`.
 
-**No dependency on `MonolithSource`** — all three adapters open their own ReadOnly handles on `EngineSource.db` rather than sharing the source subsystem's in-memory handle. The Phase 2 module-dep audit and Phase 3a cppreflect indexer read the source-indexer's existing symbol tables but open their own ReadOnly handles for the same reason as Phase 1 (no `GetRawDatabase()` accessor on `FMonolithSourceDatabase` as of v0.17.0).
+**Phase 4a adds no new module deps.** The network indexer's second UHT-artefact sweep reuses `Core` (`FRegexPattern`, `FFileHelper`, `IFileManager`) — the same surface Phase 3a uses. The four cross-namespace audit handlers use `IAssetRegistry::GetReferencers` / `GetAssetsByPath` (already linked via Phase 3a's `AssetRegistry` dep). The two pipeline composers fan out other registered actions via `FMonolithToolRegistry::ExecuteAction` — already available via `MonolithCore`. **Build.cs unchanged from Phase 3a → Phase 4a.**
 
-No conditional-gate `WITH_*` macros — the module loads unconditionally and contributes 16 actions (5 `decision` + 5 `risk` + 1 `source` audit + 5 `cppreflect`) to every install.
+**No dependency on `MonolithSource`** — all adapters open their own ReadOnly handles on `EngineSource.db` rather than sharing the source subsystem's in-memory handle. The Phase 2 module-dep audit and Phase 3a / Phase 4a indexers read the source-indexer's existing symbol tables but open their own ReadOnly handles for the same reason as Phase 1 (no `GetRawDatabase()` accessor on `FMonolithSourceDatabase` as of v0.17.0).
+
+No conditional-gate `WITH_*` macros — the module loads unconditionally and contributes 26 actions (5 `decision` + 5 `risk` + 1 `source` audit + 5 `cppreflect` + 4 `network` + 2 `pipeline` + 4 audit actions across `material` / `niagara` / `blueprint` / `project`) to every install.
 
 ---
 
-## 8. Configuration
+## 12. Configuration
 
 **Editor location:** Editor Preferences → Plugins → "Monolith Reflection Intel"
 **INI file:** `Config/MonolithSettings.ini`
@@ -852,6 +1094,8 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 | `GitMiningNoiseFilter` | `["Saved/*", "Intermediate/*", "Binaries/*", "*.uasset", "*.umap"]` | Risk | File-pattern blacklist applied to git-log output before pair / churn aggregation. Patterns are glob-style; an entry matches any file whose project-relative path matches the glob. |
 | `bIndexEnginePluginReflection` | `false` | CppReflect | Include engine-plugin UHT artefacts in the Phase 3a sweep. Default `false` keeps Phase 3a scoped to project + project-plugin reflection — engine-side surface area floods low-signal hits. Setting `true` walks every UHT artefact directory under the engine, multiplying index time and DB size. |
 | `UHTArtefactRoot` | `""` (auto-discover) | CppReflect | Override the UHT artefact root. Empty string resolves to `FPaths::ProjectIntermediateDir() / TEXT("Build")` and walks every `Win64/.../Inc/<Module>/UHT/` subtree. Set explicitly only when running against a non-standard intermediate layout (CI mirrors, packaged-only builds with a separated `Intermediate/`). |
+| `bEnableNetworkReplicationAudit` | `true` | Network | Toggle the Phase 4a network replication indexer + the four `network_query` actions. When `false`, `FNetworkIndexer::Run` short-circuits at entry and `network_query` returns a status string per call. The cross-namespace audit actions on `material` / `niagara` / `blueprint` / `project` are not gated by this flag — they continue to function. |
+| `bEnablePipelineComposers` | `true` | Pipeline | Toggle the Phase 4a `pipeline_query("pr_review")` + `pipeline_query("release_readiness")` composers. When `false`, both actions return a status string instead of fanning out. Useful for benchmarking the individual underlying actions without composer overhead. |
 
 `UMonolithReflectionIntelSettings::Get()` returns the cached CDO — cheap, allocation-free.
 
@@ -859,21 +1103,24 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 
 ---
 
-## 9. Threading Model
+## 13. Threading Model
 
 - **Phase 1 indexer (`FDecisionRecordIndexer::Run`)** runs on whatever thread invoked `FMonolithReflectionIntelModule::RunDecisionIndexerOnce`. In practice that is the game thread (first-call adapter path) or whichever thread fired `FCoreUObjectDelegates::ReloadCompleteDelegate` (Live Coding fires this on the game thread). The indexer is single-threaded by construction; SQLite ops use a single `FSQLiteDatabase` handle that lives only for the duration of `Run`.
 - **Phase 2 indexers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`)** are scheduled on background threads via `FRunnableThread` after first-call detection — `MonolithReflectionIntelModule.cpp` posts the work to a background runnable and the calling action returns immediately if the table is missing. **However:** the lazy-bootstrap subprocess that fires `git log` during first-ever-call indexing currently runs on the game thread inline. This is a documented trade-off — first-call latency on a fresh install (~200ms on Leviathan-scale repos) is acceptable for the simpler control flow. Subsequent reindex invocations run fully on the background thread.
 - **Phase 3a indexer (`FCppReflectIndexer::Run`)** runs on a background thread during the indexer pass — UHT artefact discovery + regex sweep + `IAssetRegistry::GetDependencies` join all happen off the game thread. The brief ReadWrite SQLite handle that wipes-and-rewrites the six Phase 3a tables follows the same `BEGIN TRANSACTION ... COMMIT` discipline as Phases 1 + 2. `IAssetRegistry::Get()` is thread-safe for the read API used (`GetDependencies`); module loading is verified done before the indexer kicks off.
-- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`, `FCppReflectQueryAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All sixteen handlers are pure read paths against cached ReadOnly handles — no mutation, no async work, no `ParallelFor`.
-- The cached ReadOnly `FSQLiteDatabase*` in each adapter's `GetRawDB` is file-scope static. Phase 1 / 2 / 3a adapter usage is game-thread-only, so the caches are not lock-protected. If the adapter surface ever fans out to background threads, add an `FCriticalSection` around each cache check/replace.
+- **Phase 4a network indexer (`FNetworkIndexer::Run`)** runs on a background thread — same pattern as Phase 3a's `FCppReflectIndexer`. The second UHT-artefact sweep + the `reflect_replicated_properties` wipe-and-rewrite happen off the game thread inside a single `BEGIN TRANSACTION ... COMMIT`. Phase 4a's four cross-namespace audit handlers (`material_query("audit_orphan_materials")`, `niagara_query("audit_cross_asset_refs")`, `blueprint_query("audit_cdo_drift")`, `project_query("audit_orphan_assets")`) run on the game thread under `FMonolithToolRegistry::ExecuteAction` — `IAssetRegistry::GetReferencers` / `GetAssetsByPath` are thread-safe but the per-asset Blueprint CDO walk in `audit_cdo_drift` requires the game thread for `UClass::GetDefaultObject` access.
+- **Phase 4a pipeline composers** run on the game thread and fan out other registered actions serially via `FMonolithToolRegistry::ExecuteAction`. No `ParallelFor`, no async dispatch. The composer holds no SQLite handles directly — every read goes through the underlying action's own handle.
+- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`, `FCppReflectQueryAdapter::*`, `FNetworkQueryAdapter::*`, `FPipelineQueryAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All 26 handlers are pure read paths against cached ReadOnly handles — no mutation, no async work, no `ParallelFor`.
+- The cached ReadOnly `FSQLiteDatabase*` in each adapter's `GetRawDB` is file-scope static. Phase 1 / 2 / 3a / 4a adapter usage is game-thread-only, so the caches are not lock-protected. If the adapter surface ever fans out to background threads, add an `FCriticalSection` around each cache check/replace.
 - No render-thread work. No `UPROPERTY(Replicated)`. No `Server`/`Client`/`NetMulticast` UFUNCTIONs. Editor-only by design.
 
 ---
 
-## 10. Cross-References
+## 14. Cross-References
 
 - **Parent spec:** [`SPEC_CORE.md`](../SPEC_CORE.md) — see §3 Module Reference and §12 Action Count Summary
-- **MCP reference:** `Docs/references/MCP.md` — `decision_query` row + `risk_query` row + `cppreflect_query` row + `source_query("audit_module_dep_reality")` entry
+- **MCP reference:** `Docs/references/MCP.md` — `decision_query` row + `risk_query` row + `cppreflect_query` row + `network_query` row + `pipeline_query` row + `source_query("audit_module_dep_reality")` entry + the 4 Phase 4a audit actions on existing namespaces
 - **C++ conventions:** `.claude/rules/scoped/cpp-code.md` — module dep gotchas (`DeveloperSettings`, `FindFilesRecursive` 6th-param, SQLite WAL trap)
 - **API verification log:** `Docs/references/UE57Gotchas.md`
 - **Bug class motivating the module-dep audit:** the `UPROPERTY` referencing a foreign-module type without that module being in `Build.cs` — surfaces as a confusing LNK2019 against UHT-generated `Z_Construct_*_NoRegister` symbols.
+- **Release-readiness composer reference:** `.claude/rules/scoped/monolith-release.md` — the sentinel-list audit + CHANGELOG completeness audit `pipeline_query("release_readiness")` invokes.

@@ -74,6 +74,18 @@ public:
 	static bool RunCppReflectIndexersOnce(FString& OutStatus);
 
 	/**
+	 * Phase 4a (v0.17.0) — run the network-replication indexer on demand.
+	 * FNetworkRepIndexer sweeps the same UHT artefact corpus Phase 3a touches
+	 * but focuses on per-property `NewProp_<X>_MetaData[]` `ReplicatedUsing`
+	 * pairs, producing reflect_replicated_properties.
+	 *
+	 * Invoked lazily by `network_query` action handlers when
+	 * `reflect_replicated_properties` is absent; also re-fired on hot-reload.
+	 * Wipe-and-rewrite semantics; tolerates missing UHT root.
+	 */
+	static bool RunNetworkIndexerOnce(FString& OutStatus);
+
+	/**
 	 * Lazily open (or return) the cached ReadOnly handle on EngineSource.db.
 	 * Owned by this module instance (TUniquePtr); torn down in ShutdownModule
 	 * so the SQLite handle + file lock release cleanly on editor exit / Live
@@ -100,6 +112,11 @@ public:
 	bool HasAttemptedCppReflectBootstrap() const { return bCppReflectBootstrapAttempted; }
 	void MarkCppReflectBootstrapAttempted()       { bCppReflectBootstrapAttempted = true; }
 
+	/** Phase 4a network-bootstrap-latch accessors. Same shape as the prior
+	 *  three latches — re-armed on module reload via StartupModule(). */
+	bool HasAttemptedNetworkBootstrap() const { return bNetworkBootstrapAttempted; }
+	void MarkNetworkBootstrapAttempted()       { bNetworkBootstrapAttempted = true; }
+
 	/** Close + drop the cached query DB handle. Called from the lazy-bootstrap
 	 *  path in FDecisionQueryAdapter::GetRawDB before invoking the indexer
 	 *  (which opens its own RW handle on the same file). */
@@ -110,6 +127,13 @@ private:
 	void RegisterRiskActions();
 	void RegisterSourceAuditActions();
 	void RegisterCppReflectActions();
+	// Phase 4a — three new register hooks. Network owns its own namespace
+	// (`network`); audit and pipeline both register against existing namespaces
+	// (material/niagara/blueprint/project for audits, `pipeline` is brand-new
+	// for the composers).
+	void RegisterNetworkActions();
+	void RegisterAuditActions();
+	void RegisterPipelineActions();
 	void OnReloadComplete(EReloadCompleteReason Reason);
 
 	FDelegateHandle ReloadCompleteHandle;
@@ -136,4 +160,11 @@ private:
 	 *  duplicate work when multiple cppreflect_query actions race the lazy
 	 *  bootstrap path in the same session. */
 	bool bCppReflectBootstrapAttempted = false;
+
+	/** Phase 4a network-bootstrap latch. Re-armed on module reload. The
+	 *  network indexer sweeps the same UHT corpus Phase 3a does; the per-
+	 *  action lazy bootstrap path in FNetworkQueryAdapter is fronted by this
+	 *  latch to avoid duplicate work when multiple network_query actions
+	 *  race the bootstrap. */
+	bool bNetworkBootstrapAttempted = false;
 };

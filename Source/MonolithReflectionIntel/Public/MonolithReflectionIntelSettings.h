@@ -105,6 +105,28 @@ public:
 	FString UHTArtefactRoot;
 
 	// ----------------------------------------------------------------
+	// Network Replication Audit (Phase 4a — v0.17.0)
+	// ----------------------------------------------------------------
+
+	/** Enable the network-replication indexer at module load + reload. Off
+	 *  disables the lazy bootstrap path; network_query actions still register
+	 *  but their handlers return empty data. */
+	UPROPERTY(EditAnywhere, config, Category="Network")
+	bool bEnableNetworkReplicationAudit = true;
+
+	// ----------------------------------------------------------------
+	// Pipeline Composers (Phase 4a — v0.17.0)
+	// ----------------------------------------------------------------
+
+	/** Enable the pipeline_query composer surface. Off does NOT prevent
+	 *  registration — handlers always register so the schema stays stable —
+	 *  but composer fan-out into individual namespaces is skipped, returning
+	 *  a minimal envelope. WISHLIST: Phase 4b will wire this through to a
+	 *  registration-time gate. */
+	UPROPERTY(EditAnywhere, config, Category="Network")
+	bool bEnablePipelineComposers = true;
+
+	// ----------------------------------------------------------------
 	// UDeveloperSettings overrides
 	// ----------------------------------------------------------------
 
