@@ -3025,8 +3025,53 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystem(const TSharedP
 
 FMonolithActionResult FMonolithNiagaraActions::HandleCreateStatelessEmitter(const TSharedPtr<FJsonObject>& Params)
 {
-	// Phase 0 stub — factory call lands in Phase 1.
-	return FMonolithActionResult::Error(TEXT("not implemented"));
+	// Phase 1 — create a standalone Lightweight (stateless) Emitter asset.
+	//
+	// IRON LAW 1 NOTE: the plan flagged `UNiagaraStatelessEmitterFactoryNew` as an
+	// unverified convention guess. source_query confirms NO such factory exists in
+	// UE 5.7 — only `UNiagaraStatelessEmitterTemplateFactoryNew` (a different class,
+	// creates `UNiagaraStatelessEmitterTemplate`, gated by a console var). In the
+	// engine, `UNiagaraStatelessEmitter` is always created via direct `NewObject` as
+	// a sub-object of a `UNiagaraSystem` (NiagaraEmitterHandle.cpp:219,
+	// NiagaraSystemViewModel.cpp:653/:672). We mirror `HandleCreateSystem`'s
+	// package + NewObject pattern to author a standalone .uasset whose top-level
+	// object is the stateless emitter itself.
+	FString SavePath = Params->GetStringField(TEXT("save_path"));
+
+	FString PackagePath, AssetName;
+	int32 LastSlash;
+	if (!SavePath.FindLastChar('/', LastSlash)) return FMonolithActionResult::Error(TEXT("Invalid save path"));
+	PackagePath = SavePath.Left(LastSlash);
+	AssetName = SavePath.Mid(LastSlash + 1);
+
+	FString FullPath = PackagePath / AssetName;
+	UPackage* Pkg = CreatePackage(*FullPath);
+	if (!Pkg) return FMonolithActionResult::Error(TEXT("Failed to create package"));
+
+	// Resolve UNiagaraStatelessEmitter's UClass at runtime via FindObject — its
+	// header lives under Niagara/Internal/ which is intentionally not exposed to
+	// dependent modules. Standard UE pattern for cross-plugin private-type access.
+	UClass* StatelessClass = FindObject<UClass>(nullptr, TEXT("/Script/Niagara.NiagaraStatelessEmitter"));
+	if (!StatelessClass) return FMonolithActionResult::Error(TEXT("UNiagaraStatelessEmitter UClass not found - Niagara plugin may not be loaded"));
+
+	UObject* Emitter = NewObject<UObject>(
+		Pkg, StatelessClass, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+	if (!Emitter) return FMonolithActionResult::Error(TEXT("Failed to create stateless emitter"));
+
+	FAssetRegistryModule::AssetCreated(Emitter);
+	Pkg->MarkPackageDirty();
+
+	// Save to disk immediately so the .uasset file exists. Mirrors HandleCreateSystem.
+	FString PackageFilename;
+	if (FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(Pkg, Emitter, *PackageFilename, SaveArgs);
+	}
+
+	return SuccessStr(Emitter->GetPathName());
 }
 
 // ============================================================================
