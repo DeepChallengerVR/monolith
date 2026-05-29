@@ -453,14 +453,16 @@ Get last crash/ensure context. *No parameters.*
 
 ### `editor.capture_scene_preview`
 
-Render a Niagara system or material in a preview scene and screenshot it.
+Render an asset in a preview scene and screenshot it. Supported `asset_type` values are `niagara`, `material`, `static_mesh`, `skeletal_mesh`, and `widget`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `asset_path` | string | **required** | Asset to preview |
-| `asset_type` | string | **required** | `niagara` or `material` |
+| `asset_type` | string | **required** | `niagara`, `material`, `static_mesh`, `skeletal_mesh`, or `widget` |
 | `preview_mesh` | string | optional | For materials: `plane`, `sphere`, `cube`. Default: `plane` |
-| `seek_time` | number | optional | Niagara sim time (seconds). Default: `0.0` |
+| `animation_path` | string | optional | Skeletal mesh only: animation sequence used for posed capture |
+| `seek_time` | number | optional | Niagara sim time or skeletal animation seek time in seconds. Default: `0.0` |
+| `scale` | number | optional | Widget only: DPI multiplier. Default: `1.0` |
 | `camera` | object | optional | `{location:[x,y,z], rotation:[p,y,r], fov:60}` |
 | `resolution` | array | optional | `[width, height]`. Default: `[512, 512]` |
 | `output_path` | string | optional | Output PNG path |
