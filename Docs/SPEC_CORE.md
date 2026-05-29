@@ -343,7 +343,7 @@ Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers i
 | bEnableNiagara | True | Enable Niagara module |
 | bEnableEditor | True | Enable Editor module |
 | bEnableConfig | True | Enable Config module |
-| bEnableIndex | True | Enable Index module |
+| bEnableIndex | True | If false, skips the indexing *run* at subsystem init (query actions stay registered, so an existing DB still answers). Escape hatch for the large-project deep-index GC-worker-exhaustion crash class |
 | bEnableSource | True | Enable Source module |
 | bEnableUI | True | Enable UI module |
 | bEnableMesh | True | Enable Mesh module (core actions) |
@@ -359,7 +359,7 @@ Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers i
 | bLogMemoryStats | False | Log memory usage during indexing for debugging. Default off — enable when investigating memory pressure |
 | LogVerbosity | 3 (Log) | 0=Silent, 1=Error, 2=Warning, 3=Log, 4=Verbose |
 
-**Note:** Module enable toggles are functional — each module checks its toggle at registration time and skips action registration if disabled.
+**Note:** Module enable toggles are functional — each module checks its toggle at registration time and skips action registration if disabled. **Exception — `bEnableIndex`:** the Index module always registers its query actions (so `project_query` answers from an existing DB); the toggle instead gates the indexing *run* at `UMonolithIndexSubsystem::Initialize`. `bDeferFirstTimeIndex` similarly skips only the automatic first-time index, leaving it triggerable via the `Monolith.StartIndex` console command.
 
 ---
 

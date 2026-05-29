@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-05-29
+
+### Fixed
+
+- **Editor crash (`Assertion failed: FreeIndex < FPageAllocator::NumWorkerCaches` — "Exceeded max active GC worker contexts", `GarbageCollection.cpp:2133`) during deep indexing of large projects on high-core-count machines.** UE 5.7's editor runs *incremental* reachability GC by default (`gc.AllowIncrementalReachability=1`, 2ms time budget). GC worker indices come from a process-global 64-slot bitmask; when an incremental reachability pass exceeds its time budget it suspends mid-pass and retains its worker contexts (and their slots) across frames, and the engine only frees them once no pass is suspended. The deep indexer drives GC continuously — a forced collect per batch plus a per-asset synchronous load (`FlushAsyncLoading`) that each kick fresh reachability passes — so on asset-heavy projects (~17k assets, heavy Fab/MetaHuman dependency graphs) suspended passes accumulate and exhaust the 64-slot pool, asserting on a parallel-GC worker thread at the same point every run. **Fix:** the deep-index run now forces *non-incremental* (fully blocking) GC for its duration via a scoped `gc.AllowIncrementalReachability=0` override (captured-and-restored on every exit path — normal, error, cancel, and editor-shutdown-mid-index). A blocking collect always runs reachability to completion in a single call, so worker slots are always freed and the leak is structurally impossible. Worker count scales with task-graph threads, so high-core-count CPUs (e.g. 24 threads) hit the original leak fastest.
+
+### Changed
+
+- **Wired up two previously-inert `MonolithSettings` index toggles** (both had been declared but had zero runtime consumers): `bEnableIndex` (when `false`, skips the indexing run at subsystem init while leaving query actions registered so an existing DB still answers) and `bDeferFirstTimeIndex` (when `true`, skips the automatic first-time index). Both give end users a config-level escape hatch for the deep-index crash class above. Added the `Monolith.StartIndex` console command (referenced by the existing `bDeferFirstTimeIndex` docs but never previously implemented) to trigger a full index manually after a deferred first-time index.
+
 ## [0.17.0] - 2026-05-29
 
 ### Added
