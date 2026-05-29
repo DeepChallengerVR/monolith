@@ -12,7 +12,7 @@
 
 Most MCP integrations for Unreal register every action as a separate tool. That floods the AI's context window with hundreds of tool names before you've asked a single question — and the actually useful stuff gets buried. I built Monolith because I wanted my AI to spend its context on my problem, not on memorising a tool catalogue.
 
-One plugin. One MCP endpoint. 23 tools instead of 1300+. The AI calls `monolith_discover()` and `monolith_guide()` when it needs to know what's available, and otherwise just hits `blueprint_query("create_asset", ...)`, `material_query("compile", ...)`, and so on.
+One plugin. One MCP endpoint. 28 tools instead of 1600+. The AI calls `monolith_discover()` and `monolith_guide()` when it needs to know what's available, and otherwise just hits `blueprint_query("create_asset", ...)`, `material_query("compile", ...)`, and so on.
 
 I use it every day. It does what I need.
 
@@ -20,9 +20,11 @@ I use it every day. It does what I need.
 
 ## What it does
 
-Monolith exposes **1358 actions across 19 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available.
+Monolith exposes **1384 actions across 24 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available.
 
-Covered domains: Blueprints, Materials, Animation, Niagara, Mesh, UI (incl. CommonUI), AI (Behavior Trees, State Trees, EQS, Smart Objects, Perception, Navigation), Gameplay Ability System, Logic Driver state machines, ComboGraph combo trees, Audio (Sound Cues + MetaSounds), Editor control (UBT builds, log capture, scene capture, asset preview & inspection), Engine source search (1M+ symbols, fully offline), Project asset search (SQLite FTS5), INI config, Level Sequences, plus a `bulk_fill` / `describe` reflection framework for deep property writes and a `monolith_guide` self-onboarding tool for your AI.
+Covered domains: Blueprints, Materials, Animation, Niagara, Mesh, UI (incl. CommonUI), AI (Behavior Trees, State Trees, EQS, Smart Objects, Perception, Navigation), Gameplay Ability System, Logic Driver state machines, ComboGraph combo trees, Audio (Sound Cues + MetaSounds), Editor control (UBT builds, log capture, scene capture, asset preview & inspection), Engine source search (1M+ symbols, fully offline), Project asset search (SQLite FTS5), INI config, Level Sequences, a `bulk_fill` / `describe` reflection framework for deep property writes, a `monolith_guide` self-onboarding tool for your AI, plus the new v0.17.0 **Reflection Intelligence** layer: `decision` (architectural decision-record harvest), `risk` (repo-level hotspot + co-change + conditional-gate signals), `cppreflect` (UE 5.7 UHT reflection-edge queries cross-joined with the asset registry), `network` (replication inspection — RPCs, OnRep handlers, unbalanced-handler audits), and `pipeline` (read-only composer actions for PR review + release pre-flight).
+
+**MCP LLM Ergonomics** (also new in v0.17.0): universal response shaping (`_fields` / `_omit` / `_compact_json`) on every action, schema-tagged param kinds with automatic `\` → `/` rewrite on asset paths, `did_you_mean` fuzzy match on dispatch errors, MCP `tools/list` annotations (read-only / destructive / idempotent hints), `source_query` cursor pagination, and a proxy-side JSONL call log. The whole point is to let your AI spend less context recovering from typos and trial-and-error.
 
 Full per-namespace breakdown: **[Tool Reference (wiki)](https://github.com/tumourlove/monolith/wiki/Tool-Reference)**.
 
@@ -91,7 +93,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and disclosure policy.
 
 ## Documentation
 
-- **[Wiki](https://github.com/tumourlove/monolith/wiki)** — installation variants, tool reference, connecting your AI, configuration, auto-updater, FAQ, sibling plugin guide, skills, optional modules, engine source index details, mesh module deep dive, horror level design, procedural geometry, genre presets, test status
+- **[Wiki](https://github.com/tumourlove/monolith/wiki)** — installation variants, tool reference, connecting your AI, configuration, auto-updater, FAQ, skills, optional modules, engine source index details, mesh module deep dive, horror level design, procedural geometry, genre presets, test status
 - **[API_REFERENCE.md](Docs/API_REFERENCE.md)** — full per-action parameter reference, regenerated from the live registry each release
 - **[SPEC_CORE.md](Docs/SPEC_CORE.md)** — technical specification and architecture; per-module specs at [`Docs/specs/`](Docs/specs/)
 - **[CHANGELOG.md](CHANGELOG.md)** — version history, contributor credits, breaking-change notes

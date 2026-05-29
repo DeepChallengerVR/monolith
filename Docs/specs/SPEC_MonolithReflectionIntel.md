@@ -39,12 +39,12 @@ The phases are independent (Phase 2 does not depend on Phase 1; Phase 3a does no
 
 The module does NOT eagerly run the indexer on `StartupModule`. Two reasons:
 
-1. The `UMonolithSourceSubsystem` may hold a ReadWrite handle on `EngineSource.db` at startup time; opening a second writer would race.
+1. UE 5.7's SQLite is built with `SQLITE_OS_OTHER=1` and a custom `unreal-fs` VFS that permits only ONE open of a given file per process — a second open of `EngineSource.db` returns `SQLITE_IOERR`. RI therefore borrows `UMonolithSourceSubsystem`'s already-open handle rather than opening its own; that handle must exist before RI can read, which the lazy path guarantees.
 2. The decision corpus is small (~50–500 records at Leviathan scale) and tolerates lazy first-call cost.
 
 Bootstrap fires on two events:
 
-- **First `decision_query` call** — `FDecisionQueryAdapter::GetRawDB` checks for the `decision_records` table; if missing, it closes its ReadOnly handle, calls `FMonolithReflectionIntelModule::RunDecisionIndexerOnce` (which opens a brief ReadWrite handle, ensures schema, writes rows, closes), and reopens ReadOnly. Subsequent calls hit the cached ReadOnly handle.
+- **First `decision_query` call** — `FDecisionQueryAdapter` checks for the `decision_records` table via the borrowed shared handle (`FMonolithSourceDatabase::GetRawHandle()`); if missing, it calls `FMonolithReflectionIntelModule::RunDecisionIndexerOnce` under `FScopeLock(&SharedDb->GetLock())`, which ensures schema and writes rows on the shared handle. (A brief private ReadWrite open is used only in the narrow window where the subsystem's handle is closed during a reindex.) Subsequent calls read directly through the borrowed handle.
 - **`FCoreUObjectDelegates::ReloadCompleteDelegate`** — bound at `StartupModule`. After Live Coding or UBT-driven hot-reload, the corpus refreshes automatically so agents see decisions added to spec files in the current session without manually triggering a re-index.
 
 The `RunDecisionIndexerOnce` entry point is idempotent — calling it repeatedly is cheap (one wipe-and-rewrite per call) and safe.
@@ -236,18 +236,16 @@ Inverse of `find_supersession_chain` — list decisions that explicitly supersed
 
 Rows ordered by `source_path, source_line`.
 
-### 3.5 ReadOnly fallback to `EngineSource.db`
+### 3.5 Borrowing the shared `EngineSource.db` handle
 
-`FDecisionQueryAdapter::GetRawDB` does NOT share `UMonolithSourceSubsystem`'s in-memory `FSQLiteDatabase` handle. The subsystem does not expose a `GetRawDatabase()` accessor on `FMonolithSourceDatabase` at the time of Phase 1 implementation, so the adapter opens its own ReadOnly handle on the same `EngineSource.db` file.
+`FDecisionQueryAdapter` borrows `UMonolithSourceSubsystem`'s already-open `EngineSource.db` handle rather than opening its own. It MUST: UE 5.7's SQLite is built with `SQLITE_OS_OTHER=1` and a custom `unreal-fs` VFS that permits only ONE open of a given file per process; a second open of `EngineSource.db` returns `SQLITE_IOERR`. `FMonolithSourceDatabase` exposes that handle via `GetRawHandle()` (the open `FSQLiteDatabase*`) and `GetLock()` (`FCriticalSection&`).
 
-SQLite tolerates concurrent readers fine when the database is opened with `journal_mode=DELETE` (Monolith's default — see the WAL silent-fail trap in `Docs/references/UE57Gotchas.md`). The subsystem's ReadWrite handle and the adapter's ReadOnly handle coexist safely:
+The borrow contract is **game-thread-only** — read-path adapters call `ensure(IsInGameThread())`. This serialises reads against the subsystem's handle close without a per-read lock: the subsystem's handle close runs on the game thread (its reindex trigger is game-thread-dispatched), and its async indexer uses a SEPARATE worker handle, so a game-thread read can never observe a half-closed handle.
 
-- ReadOnly takes no write lock; queries never block writes.
-- The indexer (`RunDecisionIndexerOnce`) opens a brief ReadWrite handle only when the table is missing on first call. The subsystem closes its handle during full reindex, so the brief overlap is non-contentious.
+- Read-path adapters borrow `GetRawHandle()` and read directly; no separate ReadOnly open, no concurrent-reader coexistence to reason about.
+- Write-path bootstrap (`RunDecisionIndexerOnce`) runs under `FScopeLock(&SharedDb->GetLock())`. A brief private ReadWrite open is used only in the narrow window where the subsystem's handle is closed during a reindex.
 
-**Migration note:** if a `GetRawDatabase()` accessor is added to `FMonolithSourceDatabase` in a later release, the adapter SHOULD migrate to the shared handle and `MonolithReflectionIntel.Build.cs` SHOULD re-add `MonolithSource` as a `PrivateDependencyModuleNames` entry. As of Phase 1, the build deps deliberately exclude `MonolithSource` to keep the dependency direction one-way.
-
-The handle is cached statically in the adapter file scope. The cache rebuilds on path change or `IsValid()` failure.
+The accessor on `FMonolithSourceDatabase` is named `GetRawHandle()` — NOT `GetRawDatabase()` (that name belongs to the unrelated `FMonolithIndexDatabase`). `MonolithReflectionIntel.Build.cs` depends on `MonolithSource` (plus `UnrealEd` + `EditorSubsystem`) to reach the subsystem; the dependency is one-way (RI → MonolithSource; MonolithSource never references RI).
 
 ### 3.6 Staleness detection
 
@@ -754,9 +752,9 @@ Find every UCLASS carrying a given specifier (`BlueprintType`, `Blueprintable`, 
 
 ### 5.6 Bootstrap pattern
 
-Lazy on first call — `FCppReflectQueryAdapter::GetRawDB` checks for `reflect_uclasses` and triggers `FMonolithReflectionIntelModule::RunCppReflectIndexerOnce` on absence. The indexer opens a brief ReadWrite handle, ensures the six tables, writes rows, closes; the adapter reopens ReadOnly. `FCoreUObjectDelegates::ReloadCompleteDelegate` is bound at `StartupModule` (shared with the Phase 1 + Phase 2 hot-reload refresh) so UBT-driven hot-reload re-runs the indexer automatically.
+Lazy on first call — `FCppReflectQueryAdapter` checks for `reflect_uclasses` via the borrowed shared handle (`FMonolithSourceDatabase::GetRawHandle()`) and triggers `FMonolithReflectionIntelModule::RunCppReflectIndexerOnce` on absence. The write-path indexer ensures the six tables and writes rows under `FScopeLock(&SharedDb->GetLock())` on the shared handle. `FCoreUObjectDelegates::ReloadCompleteDelegate` is bound at `StartupModule` (shared with the Phase 1 + Phase 2 hot-reload refresh) so UBT-driven hot-reload re-runs the indexer automatically.
 
-Both the indexer's ReadWrite handle and the adapter's ReadOnly handle open `EngineSource.db` with `PRAGMA journal_mode=DELETE` — the WAL-silent-fail trap from `Docs/references/UE57Gotchas.md` applies. Concurrent readers coexist safely; the brief ReadWrite overlap during initial indexing is non-contentious.
+Read-path queries borrow the subsystem's single open handle directly under the game-thread-only contract (`ensure(IsInGameThread())`); there is no second open to coexist with — UE 5.7's `unreal-fs` VFS would reject a second open of `EngineSource.db` with `SQLITE_IOERR`. The shared handle's `PRAGMA journal_mode=DELETE` (the WAL-silent-fail trap from `Docs/references/UE57Gotchas.md`) applies as set by the subsystem.
 
 ### 5.7 Known limitations
 
@@ -1061,7 +1059,7 @@ Phase 4b would add three audit families on top of the Phase 4a + Phase 3b substr
 | Deps | Type |
 |------|------|
 | `Core`, `CoreUObject`, `Engine` | `PublicDependencyModuleNames` |
-| `MonolithCore`, `SQLiteCore`, `DeveloperSettings`, `Json`, `JsonUtilities`, `Projects`, `AssetRegistry` | `PrivateDependencyModuleNames` |
+| `MonolithCore`, `MonolithSource`, `SQLiteCore`, `DeveloperSettings`, `Json`, `JsonUtilities`, `Projects`, `AssetRegistry`, `UnrealEd`, `EditorSubsystem` | `PrivateDependencyModuleNames` |
 
 `DeveloperSettings` is its own module (NOT part of `Engine`) — required for the `UDeveloperSettings`-derived `UMonolithReflectionIntelSettings`. Documented in `.claude/rules/scoped/cpp-code.md` § Module Dependencies; LNK2019 trap if omitted.
 
@@ -1071,7 +1069,7 @@ Phase 4b would add three audit families on top of the Phase 4a + Phase 3b substr
 
 **Phase 4a adds no new module deps.** The network indexer's second UHT-artefact sweep reuses `Core` (`FRegexPattern`, `FFileHelper`, `IFileManager`) — the same surface Phase 3a uses. The four cross-namespace audit handlers use `IAssetRegistry::GetReferencers` / `GetAssetsByPath` (already linked via Phase 3a's `AssetRegistry` dep). The two pipeline composers fan out other registered actions via `FMonolithToolRegistry::ExecuteAction` — already available via `MonolithCore`. **Build.cs unchanged from Phase 3a → Phase 4a.**
 
-**No dependency on `MonolithSource`** — all adapters open their own ReadOnly handles on `EngineSource.db` rather than sharing the source subsystem's in-memory handle. The Phase 2 module-dep audit and Phase 3a / Phase 4a indexers read the source-indexer's existing symbol tables but open their own ReadOnly handles for the same reason as Phase 1 (no `GetRawDatabase()` accessor on `FMonolithSourceDatabase` as of v0.17.0).
+**Depends on `MonolithSource` (+ `UnrealEd` + `EditorSubsystem`)** — all adapters borrow `UMonolithSourceSubsystem`'s already-open `EngineSource.db` handle via `FMonolithSourceDatabase::GetRawHandle()` / `GetLock()` rather than opening their own. They MUST: UE 5.7's SQLite (`SQLITE_OS_OTHER=1` + `unreal-fs` VFS) permits only one open of a file per process, so a second open returns `SQLITE_IOERR`. The dependency is one-way (RI → MonolithSource; MonolithSource never references RI) and therefore non-circular. The Phase 2 module-dep audit and Phase 3a / Phase 4a indexers read the source-indexer's existing symbol tables through the same borrowed handle. The accessor is `GetRawHandle()`, NOT `GetRawDatabase()` (that name belongs to the unrelated `FMonolithIndexDatabase`).
 
 No conditional-gate `WITH_*` macros — the module loads unconditionally and contributes 26 actions (5 `decision` + 5 `risk` + 1 `source` audit + 5 `cppreflect` + 4 `network` + 2 `pipeline` + 4 audit actions across `material` / `niagara` / `blueprint` / `project`) to every install.
 
@@ -1107,11 +1105,11 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 
 - **Phase 1 indexer (`FDecisionRecordIndexer::Run`)** runs on whatever thread invoked `FMonolithReflectionIntelModule::RunDecisionIndexerOnce`. In practice that is the game thread (first-call adapter path) or whichever thread fired `FCoreUObjectDelegates::ReloadCompleteDelegate` (Live Coding fires this on the game thread). The indexer is single-threaded by construction; SQLite ops use a single `FSQLiteDatabase` handle that lives only for the duration of `Run`.
 - **Phase 2 indexers (`FGitChurnIndexer`, `FGitCoChangeIndexer`, `FConditionalGateIndexer`)** are scheduled on background threads via `FRunnableThread` after first-call detection — `MonolithReflectionIntelModule.cpp` posts the work to a background runnable and the calling action returns immediately if the table is missing. **However:** the lazy-bootstrap subprocess that fires `git log` during first-ever-call indexing currently runs on the game thread inline. This is a documented trade-off — first-call latency on a fresh install (~200ms on Leviathan-scale repos) is acceptable for the simpler control flow. Subsequent reindex invocations run fully on the background thread.
-- **Phase 3a indexer (`FCppReflectIndexer::Run`)** runs on a background thread during the indexer pass — UHT artefact discovery + regex sweep + `IAssetRegistry::GetDependencies` join all happen off the game thread. The brief ReadWrite SQLite handle that wipes-and-rewrites the six Phase 3a tables follows the same `BEGIN TRANSACTION ... COMMIT` discipline as Phases 1 + 2. `IAssetRegistry::Get()` is thread-safe for the read API used (`GetDependencies`); module loading is verified done before the indexer kicks off.
-- **Phase 4a network indexer (`FNetworkIndexer::Run`)** runs on a background thread — same pattern as Phase 3a's `FCppReflectIndexer`. The second UHT-artefact sweep + the `reflect_replicated_properties` wipe-and-rewrite happen off the game thread inside a single `BEGIN TRANSACTION ... COMMIT`. Phase 4a's four cross-namespace audit handlers (`material_query("audit_orphan_materials")`, `niagara_query("audit_cross_asset_refs")`, `blueprint_query("audit_cdo_drift")`, `project_query("audit_orphan_assets")`) run on the game thread under `FMonolithToolRegistry::ExecuteAction` — `IAssetRegistry::GetReferencers` / `GetAssetsByPath` are thread-safe but the per-asset Blueprint CDO walk in `audit_cdo_drift` requires the game thread for `UClass::GetDefaultObject` access.
+- **Phase 3a indexer (`FCppReflectIndexer::Run`)** runs on a background thread during the indexer pass — UHT artefact discovery + regex sweep + `IAssetRegistry::GetDependencies` join all happen off the game thread. The SQLite wipe-and-rewrite of the six Phase 3a tables runs under `FScopeLock(&SharedDb->GetLock())` on the borrowed shared handle and follows the same `BEGIN TRANSACTION ... COMMIT` discipline as Phases 1 + 2. `IAssetRegistry::Get()` is thread-safe for the read API used (`GetDependencies`); module loading is verified done before the indexer kicks off.
+- **Phase 4a network indexer (`FNetworkIndexer::Run`)** runs on a background thread — same pattern as Phase 3a's `FCppReflectIndexer`. The second UHT-artefact sweep + the `reflect_replicated_properties` wipe-and-rewrite happen off the game thread under `FScopeLock(&SharedDb->GetLock())` inside a single `BEGIN TRANSACTION ... COMMIT`. Phase 4a's four cross-namespace audit handlers (`material_query("audit_orphan_materials")`, `niagara_query("audit_cross_asset_refs")`, `blueprint_query("audit_cdo_drift")`, `project_query("audit_orphan_assets")`) run on the game thread under `FMonolithToolRegistry::ExecuteAction` — `IAssetRegistry::GetReferencers` / `GetAssetsByPath` are thread-safe but the per-asset Blueprint CDO walk in `audit_cdo_drift` requires the game thread for `UClass::GetDefaultObject` access.
 - **Phase 4a pipeline composers** run on the game thread and fan out other registered actions serially via `FMonolithToolRegistry::ExecuteAction`. No `ParallelFor`, no async dispatch. The composer holds no SQLite handles directly — every read goes through the underlying action's own handle.
-- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`, `FCppReflectQueryAdapter::*`, `FNetworkQueryAdapter::*`, `FPipelineQueryAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All 26 handlers are pure read paths against cached ReadOnly handles — no mutation, no async work, no `ParallelFor`.
-- The cached ReadOnly `FSQLiteDatabase*` in each adapter's `GetRawDB` is file-scope static. Phase 1 / 2 / 3a / 4a adapter usage is game-thread-only, so the caches are not lock-protected. If the adapter surface ever fans out to background threads, add an `FCriticalSection` around each cache check/replace.
+- **Adapter handlers (`FDecisionQueryAdapter::*`, `FRiskQueryAdapter::*`, `FModuleDepRealityAdapter::*`, `FCppReflectQueryAdapter::*`, `FNetworkQueryAdapter::*`, `FPipelineQueryAdapter::*`)** run on the game thread under `FMonolithToolRegistry::ExecuteAction`. All 26 handlers are pure read paths against the borrowed shared `EngineSource.db` handle — no mutation, no async work, no `ParallelFor`.
+- Read-path adapters borrow the subsystem's single open handle via `FMonolithSourceDatabase::GetRawHandle()` and enforce a game-thread-only contract with `ensure(IsInGameThread())`. This is what makes the lock-free read safe: the subsystem's handle close runs on the game thread (its reindex trigger is game-thread-dispatched) and its async indexer uses a SEPARATE worker handle, so a game-thread read serialises against the close without a per-read lock. If the adapter surface ever fans out to background threads, reads must take `FScopeLock(&SharedDb->GetLock())` like the write path already does.
 - No render-thread work. No `UPROPERTY(Replicated)`. No `Server`/`Client`/`NetMulticast` UFUNCTIONs. Editor-only by design.
 
 ---
