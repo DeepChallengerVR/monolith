@@ -14,12 +14,12 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, registers 33 actions (20 base + 2 Phase J F8 map actions + 2 v0.14.8 PR #48 automation + 2 v0.14.9 Issue #50 scripting + 3 v0.14.10 PR #54 PIE/console + 4 v0.16.0 preview & inspection) |
+| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, subscribes a `FCoreDelegates::PreSlateModal` watcher (see Module-Level Modal Watcher below), registers 41 actions (20 base + 2 Phase J F8 map actions + 2 v0.14.8 PR #48 automation + 2 v0.14.9 Issue #50 scripting + 3 v0.14.10 PR #54 PIE/console + 4 v0.16.0 preview & inspection + 7 Warband harness Wave 1 + 1 Warband harness Wave 2 `list_errored_blueprints`) |
 | `FMonolithLogCapture` | FOutputDevice subclass. Ring buffer (10,000 entries max). Thread-safe. Tracks counts by verbosity |
 | `FMonolithEditorActions` | Static handlers for build and log operations. Hooks into `ILiveCodingModule::GetOnPatchCompleteDelegate()` to capture compile results and timestamps |
 | `FMonolithSettingsCustomization` | IDetailCustomization for UMonolithSettings. Adds re-index buttons for project and source databases in Project Settings UI |
 
-### Actions (33 — namespace: "editor")
+### Actions (41 — namespace: "editor")
 
 **Base (22 — v0.14.7 baseline + Phase J F8)**
 
@@ -85,5 +85,37 @@
 | `inspect_texture_channels` | `LockMipReadOnly` on `UTexture2D` source mip 0; walks pixel buffer per channel for min/max/mean statistics. Returns width, height, runtime pixel format, sRGB flag, has_alpha flag. Optional `emit_splits=true` writes 4 grayscale-replicated BGRA8 PNGs to `output_dir` for per-channel visual diff. Non-BGRA8 source returns a clean warning payload rather than mis-decoded bytes. |
 
 Plus `capture_scene_preview` (in Base section above) was **extended** in v0.16.0: `asset_type` enum now also accepts `static_mesh`, `skeletal_mesh` (with optional `animation_path` + `seek_time` for posed-frame capture), and `widget` (UMG via `FWidgetRenderer` with `scale` DPI multiplier). No new action — schema widening only.
+
+**Warband Harness — Wave 1 (7 — save / async-PIE smoke / nav harness)**
+
+| Action | Description |
+|--------|-------------|
+| `list_dirty_packages` | Report loaded packages with unsaved changes (`UPackage::IsDirty`), optionally scoped to one or more `/Game` path prefixes. Returns per-package `{ package, is_map, disk_path, transient }`. Params: `scope_paths[]` (omit for all dirty), `include_transient` (default false), `include_maps` (default true), `include_content` (default true). Use to audit what a `save_packages` call would touch. |
+| `save_packages` | Save the requested packages to disk (`UPackage::SavePackage` + `FSavePackageArgs`). Returns per-package save status. Params: `packages[]` (required, long package names), `fail_on_unrequested_dirty` (default false — when true, aborts saving nothing if a dirty package exists outside the request set, bounded by `scope_paths` if given), `scope_paths[]`, `dry_run` (default false — reports per-package `would_save` without writing). |
+| `run_pie_smoke` | Start an **async** PIE smoke session on a map and return immediately with `{ session_id, status: "running", started: true }`. Loads the map, starts PIE synchronously, emits a `UE_LOG` marker, and registers a session that the editor's real frame loop advances over real frames, sampling the target pawn's AnimInstance vars. Params: `map` (omit = current level), `marker` (default `WARBAND_SMOKE` — post-marker log-pattern matching counts only lines after it), `duration` (seconds, clamped 0–120, default 5), `sample_vars[]` (default `[GroundSpeed, bShouldMove, DesiredYawDelta]`), `pawn_class` (substring match; omit = first PC's pawn), `console_script[]`, `python_script`, `log_patterns[]` (extra case-insensitive post-marker substrings), `on_compile_errors` (`"refuse"` default / `"suppress"`). Does NOT block the editor frame. Poll with `poll_pie_smoke`; force-end with `stop_pie_smoke`. **`on_compile_errors` policy:** before starting PIE the action pre-flights for errored Blueprints (the same `BS_Error && bDisplayCompilePIEWarning` condition `list_errored_blueprints` reports). `"refuse"` (default, safe) returns a structured error listing the offending `{name, path}` and does NOT start PIE — this prevents the engine's blocking PIE compile-error modal, which would freeze the editor and starve the in-process MCP server. `"suppress"` wraps the play-session request in `TGuardValue<bool>(GIsRunningUnattendedScript, true)` so the engine skips the prompt and starts PIE anyway. |
+| `poll_pie_smoke` | Poll an async PIE-smoke session by `session_id` (required). Returns `{ status (running/complete/stopped/error), elapsed_seconds, sample_count, pie_active, per-var min/max/last summary, post_marker_counts:{pattern:count} }`. When `status==complete` includes the full report (all samples + captured frame paths for the clip variant). `include_samples` (default false) appends the full per-frame sample array even before completion. Does not advance PIE — the editor frame loop does that. |
+| `stop_pie_smoke` | Force-stop a PIE-smoke session (`RequestEndPlayMap` + mark stopped) and return its final report. With no `session_id`, stops ALL running sessions. Also serves as cleanup — the shared frame observer self-unregisters once no sessions remain running. |
+| `capture_pie_movement_clip` | Start an async PIE-smoke session (same model as `run_pie_smoke`) that ALSO captures a PIE viewport frame every `capture_interval` seconds into `output_path`, plus per-frame AnimInstance sampling. Returns `{ session_id, status: "running", started: true }` immediately; `poll_pie_smoke` returns sampled values + captured frame paths. Params mirror `run_pie_smoke` plus `marker` (default `WARBAND_CLIP`), `capture_interval` (seconds, clamped 0.05–5, default 0.25), `output_path` (default `Saved/Screenshots/Monolith/PieClip/<timestamp>/`). If viewport capture is unavailable during PIE the session continues and poll reports `capture_deferred`. |
+| `create_nav_harness_map` | Build a navigation test map from a JSON spec: blank `UWorld`, floor, nav bounds, camera, target points, and BP/actor instances with UPROPERTY defaults (incl. `FSoftObjectPath`). All spawned actors get a `SetFolderPath`. Rebuilds + validates nav via runtime `ai` dispatch (`ai.rebuild_navigation`) and saves. Params: `path` (required, throwaway map path), `floor` `{location, scale, mesh}`, `nav_bounds` `{location, extent}`, `camera` `{location, rotation}`, `target_points[]` `{name, location}` (spawned as `ATargetPoint`, also used as nav validation points), `actors[]` `{class, location, rotation, folder, properties{}}`, `validate_pairs[]` `{from, to}` (target-point name pairs that must have a nav path), `nav_timeout` (seconds, default 30). |
+
+**Async PIE design rationale.** `run_pie_smoke` / `capture_pie_movement_clip` are an async session family rather than a single blocking call because a synchronous in-handler engine pump is impossible: the MCP handler runs *inside* the editor's frame, so calling `GEditor->Tick` / `UWorld::Tick` / `ProcessAsyncLoading` from within the handler re-enters the engine tick and trips re-entrancy asserts (the prior synchronous pump re-entered `UWorld::Tick` and crashed). The async design sidesteps this: `run` starts PIE and registers a frame observer, then returns a `session_id` immediately; the editor's own real frame loop advances PIE and accumulates AnimInstance samples + post-marker log-pattern counts; `poll` reads the accumulated state; `stop` force-ends and cleans up (the shared observer self-unregisters when no sessions remain). `capture_pie_movement_clip` reuses the same session model, adding per-interval viewport capture.
+
+**Warband Harness — Wave 2 (1 — compile-error pre-flight)**
+
+| Action | Description |
+|--------|-------------|
+| `list_errored_blueprints` | Read-only scan of all loaded `UBlueprint`s for unresolved compile errors (`Status == BS_Error && bDisplayCompilePIEWarning`) — the exact condition the engine tests before raising its blocking PIE compile-error modal. Returns `{ count, blueprints: [{ name, path }] }`. Run before `run_pie_smoke` to know in advance whether PIE will be refused or blocked. No params. |
+
+### Module-Level Modal Watcher
+
+`FMonolithEditorModule::StartupModule` subscribes a watcher to `FCoreDelegates::PreSlateModal`. Immediately before the engine enters any blocking modal loop, the watcher emits, on the game thread, a single structured log line:
+
+```
+LogMonolith: Warning: MODAL_OPEN ts=<timestamp> title=<window-title> text=<message-text>
+```
+
+The purpose is recovery: when a blocking modal opens, the in-process MCP server is the strangled thread and cannot respond, but an external agent tailing the editor log can read this line and recover context (what dialog opened, when). `title` and `text` are **best-effort** — they are empty when the modal window is not yet on the modal stack at broadcast time.
+
+**Honest scope limitation:** this watcher provides notification only. Synchronous live modal-read and programmatic modal dismissal are **NOT** provided and are architecturally unsound here — the in-process server is the very thread the modal blocks, so it cannot service a request to read or close the dialog while the modal loop owns the thread. Prevention (`run_pie_smoke`'s `on_compile_errors="refuse"`, `list_errored_blueprints`) is the supported path; the watcher is the fallback for modals that open despite prevention.
 
 ---

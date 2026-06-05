@@ -6,6 +6,8 @@
 #include "MonolithAbpWriteActions.h"
 #include "MonolithAnimLayoutActions.h"
 #include "MonolithAnimationBulkFillAdapter.h"
+#include "MonolithChooserActions.h"
+#include "MonolithAbpGraphSurgeryActions.h"
 #include "MonolithToolRegistry.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithAnimationModule"
@@ -17,6 +19,8 @@ void FMonolithAnimationModule::StartupModule()
 	FMonolithControlRigWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAnimLayoutActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithChooserActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithAbpGraphSurgeryActions::RegisterActions(FMonolithToolRegistry::Get());
 
 	// Phase 5 Step 6 (MCP Ergonomics, 2026-05-11) — register the animation adapter.
 	// PoseSearchDatabase fill_kind replaces the 40+ add_database_animation
@@ -30,6 +34,7 @@ void FMonolithAnimationModule::ShutdownModule()
 {
 	FMonolithAnimationBulkFillAdapter::Unregister();
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("animation"));
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("chooser"));
 }
 
 #undef LOCTEXT_NAMESPACE

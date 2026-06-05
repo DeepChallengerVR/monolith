@@ -9,7 +9,7 @@
 ## MonolithAI
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AIModule, GameplayTasks, NavigationSystem, Json, JsonUtilities
-**Namespace:** `ai` | **Tool:** `ai_query(action, params)` | **Actions:** 221 (Phase J F8: +`add_perception_to_actor`, +`get_bt_graph`)
+**Namespace:** `ai` | **Tool:** `ai_query(action, params)` | **Actions:** 223 (Phase J F8: +`add_perception_to_actor`, +`get_bt_graph`; Warband harness Wave 1: +`rebuild_navigation`, +`validate_nav_points`)
 **Conditional:** State Trees (`#if WITH_STATETREE`) and Smart Objects (`#if WITH_SMARTOBJECTS`) are required dependencies. Mass Entity (`#if WITH_MASSENTITY`) and Zone Graph (`#if WITH_ZONEGRAPH`) are optional extensions. When required deps are absent, the module compiles to an empty stub (0 actions registered).
 **Settings toggle:** `bEnableAI` (default: True)
 
@@ -29,13 +29,22 @@ Counts below are the **actual** registrations from `Source/MonolithAI/Private/Mo
 | AI Controllers | 10 | `MonolithAIControllerActions.cpp` | Controller configuration, team assignment, focus management |
 | Perception | 11 | `MonolithAIPerceptionActions.cpp` | Sight/hearing/damage/team sense configuration, stimulus management (AIController-only) |
 | Perception Scaffold | 1 | `MonolithAIPerceptionScaffoldActions.cpp` | **F8** `add_perception_to_actor` — accepts ANY actor BP (not just AIControllers) plus a `senses` array |
-| Navigation | 24 | `MonolithAINavigationActions.cpp` | NavMesh queries, path finding, nav link management, nav modifier volumes |
+| Navigation | 26 | `MonolithAINavigationActions.cpp` | NavMesh queries, path finding, nav link management, nav modifier volumes. **Warband harness Wave 1:** +`rebuild_navigation`, +`validate_nav_points` |
 | Runtime/PIE | 14 | `MonolithAIRuntimeActions.cpp` | Runtime BT/ST inspection, active task queries, blackboard value read/write in PIE |
 | Scaffolding | 23 | `MonolithAIScaffoldActions.cpp` | Pre-built AI patterns: patrol, guard, investigate, flee, horror stalker, search area |
 | Discovery | 11 | `MonolithAIDiscoveryActions.cpp` | AI asset overview, explain, compare, validate, search |
 | Advanced | 12 | `MonolithAIAdvancedActions.cpp` | Mass Entity + Zone Graph cross-module integration (conditional `#if WITH_MASSENTITY`, `#if WITH_ZONEGRAPH`) |
 
-**Total:** 32 + 12 + 35 + 20 + 16 + 10 + 11 + 1 + 24 + 14 + 23 + 11 + 12 = **221**.
+**Total:** 32 + 12 + 35 + 20 + 16 + 10 + 11 + 1 + 26 + 14 + 23 + 11 + 12 = **223**.
+
+### Warband Harness — Wave 1 nav actions
+
+Two navigation actions added for the Warband harness workflow (`MonolithAINavigationActions.cpp`):
+
+| Action | Params | Description |
+|--------|--------|-------------|
+| `rebuild_navigation` | `save_after` (bool), `nav_timeout` (seconds) | Rebuild the navigation system with a bounded async-generation wait, optionally saving the level after generation completes. |
+| `validate_nav_points` | `points:[{name, location}]`, `pairs` (index references) | Per-point projection onto the navmesh plus per-pair path existence / length check. `pairs` reference points by index into `points`. |
 
 ### Phase J fixes touching this module
 

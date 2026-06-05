@@ -69,12 +69,36 @@
 #include "Engine/Engine.h"
 #include "GameFramework/PlayerController.h"
 
+// PIE pre-flight compile gate + list_errored_blueprints: iterate loaded UBlueprints
+// and test the same {BS_Error, bDisplayCompilePIEWarning} pair the engine's
+// ResolveDirtyBlueprints uses (PlayLevel.cpp) to decide whether to raise the blocking
+// "unresolved compiler errors" PIE prompt. GIsRunningUnattendedScript (CoreGlobals.h,
+// included above) + TGuardValue (UnrealTemplate.h) suppress that modal in suppress mode.
+#include "UObject/UObjectIterator.h"
+#include "Engine/Blueprint.h"
+#include "Templates/UnrealTemplate.h"
+
 // start_pie needs the level-editor module + asset viewport to pin PIE to in-viewport mode
 #include "LevelEditor.h"
 #include "IAssetViewport.h"
 #include "Modules/ModuleManager.h"
 #include "Editor/UnrealEdEngine.h"
 #include "UnrealEdGlobals.h"
+
+// run_pie_smoke / poll_pie_smoke / stop_pie_smoke / capture_pie_movement_clip:
+// async session-based PIE smoke advanced by the editor's real frame loop.
+#include "MonolithPieSmokeSession.h"
+#include "Animation/AnimInstance.h"
+#include "GameFramework/Pawn.h"
+#include "Misc/ScopeExit.h"           // ON_SCOPE_EXIT (always-unbind the PostPIEStarted handle)
+
+// create_nav_harness_map: actor spawning + reflective property set + registry dispatch
+#include "Engine/StaticMeshActor.h"
+#include "Camera/CameraActor.h"
+#include "Engine/TargetPoint.h"
+#include "GameFramework/Actor.h"
+#include "UObject/UnrealType.h"
+#include "UObject/SoftObjectPath.h"
 
 // --- Compile state ---
 
@@ -310,6 +334,10 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 	CachedLogCapture = LogCapture;
 	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
 
+	// Hand the shared log capture to the async PIE-smoke session manager so poll/stop
+	// can compute post-marker pattern counts from the same ring buffer.
+	FPieSmokeSessionManager::Get().SetLogCapture(LogCapture);
+
 	Registry.RegisterAction(TEXT("editor"), TEXT("trigger_build"),
 		TEXT("Trigger a Live Coding compile"),
 		FMonolithActionHandler::CreateStatic(&HandleTriggerBuild),
@@ -411,6 +439,97 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 		TEXT("Stop the active Play-In-Editor session."),
 		FMonolithActionHandler::CreateStatic(&HandleStopPIE),
 		MakeShared<FJsonObject>());
+
+	// --- Package state (F1: warband-harness plan 2026-06-04) ---
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("list_dirty_packages"),
+		TEXT("Report loaded packages with unsaved changes (UPackage::IsDirty), optionally scoped to one or more /Game path prefixes. Returns per-package {package, is_map, disk_path, transient}. Use to audit what a save_packages call would touch."),
+		FMonolithActionHandler::CreateStatic(&HandleListDirtyPackages),
+		FParamSchemaBuilder()
+			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Array of /Game path prefixes to filter by (e.g. [\"/Game/Tests/Monolith/Warband\"]). Omit for all dirty packages. Transient/in-memory packages are excluded unless include_transient=true."))
+			.Optional(TEXT("include_transient"), TEXT("bool"), TEXT("Include /Engine/Transient and other non-disk packages. Default false."), TEXT("false"))
+			.Optional(TEXT("include_maps"), TEXT("bool"), TEXT("Include dirty map packages (UPackage::ContainsMap). Default true."), TEXT("true"))
+			.Optional(TEXT("include_content"), TEXT("bool"), TEXT("Include dirty non-map (content) packages. Default true."), TEXT("true"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("save_packages"),
+		TEXT("Save the requested packages to disk (UPackage::SavePackage + FSavePackageArgs). When fail_on_unrequested_dirty=true, errors before saving anything if any dirty package exists outside the requested set (within scope_paths if given). Returns per-package save status."),
+		FMonolithActionHandler::CreateStatic(&HandleSavePackages),
+		FParamSchemaBuilder()
+			.Required(TEXT("packages"), TEXT("array"), TEXT("Array of long package names (e.g. [\"/Game/Tests/Monolith/Warband/DA_Foo\"]) to save."))
+			.Optional(TEXT("fail_on_unrequested_dirty"), TEXT("bool"), TEXT("If true, abort (saving nothing) when a dirty package outside the request set is found. Default false."), TEXT("false"))
+			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Path prefixes that bound the unrequested-dirty pre-scan (only used with fail_on_unrequested_dirty). Omit to scan all dirty packages."))
+			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("If true, report which packages WOULD be saved (per-package would_save status) without writing anything to disk. Default false."), TEXT("false"))
+			.Build());
+
+	// --- PIE smoke + capture (F2/F3: warband-harness plan 2026-06-04) ---
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("run_pie_smoke"),
+		TEXT("Start an ASYNC PIE smoke session on a map and RETURN IMMEDIATELY. Loads the map, starts PIE (synchronously), emits a UE_LOG marker, and registers a session that the editor's REAL frame loop advances over real frames (sampling the target pawn's AnimInstance vars). Returns {session_id, status:'running', started:true}. Poll progress / the final report with poll_pie_smoke; force-end with stop_pie_smoke. Does NOT block the editor frame (the old synchronous pump re-entered UWorld::Tick and crashed)."),
+		FMonolithActionHandler::CreateStatic(&HandleRunPieSmoke),
+		FParamSchemaBuilder()
+			.OptionalAssetPath(TEXT("map"), TEXT("Level asset path to load before PIE (e.g. /Game/Tests/Monolith/Maps/M_Harness). Omit to use the current editor level."))
+			.Optional(TEXT("marker"), TEXT("string"), TEXT("Marker token emitted to the log; post-marker pattern matching counts only lines after it. Default WARBAND_SMOKE."), TEXT("WARBAND_SMOKE"))
+			.Optional(TEXT("duration"), TEXT("number"), TEXT("Seconds the editor loop advances PIE before the session auto-completes (clamped 0-120). Default 5."), TEXT("5"))
+			.Optional(TEXT("sample_vars"), TEXT("array"), TEXT("AnimInstance variable names sampled each frame. Default [GroundSpeed, bShouldMove, DesiredYawDelta]."))
+			.Optional(TEXT("pawn_class"), TEXT("string"), TEXT("Substring of the target pawn's class name to sample (resolves a matching pawn). Omit to use the first player controller's pawn."))
+			.Optional(TEXT("console_script"), TEXT("array"), TEXT("Console command strings run on the PIE world at start (e.g. [\"WalkLoop\"])."))
+			.Optional(TEXT("python_script"), TEXT("string"), TEXT("Python source run via IPythonScriptPlugin at start."))
+			.Optional(TEXT("log_patterns"), TEXT("array"), TEXT("Extra case-insensitive substrings to count after the marker, in addition to the default set."))
+			.Optional(TEXT("on_compile_errors"), TEXT("string"), TEXT("Policy when loaded Blueprints have unresolved compile errors: \"refuse\" (default, safe) returns an error + the offending {name,path} list and does NOT start PIE; \"suppress\" starts PIE anyway and silences the engine's blocking compile-error modal (which would otherwise freeze the editor + MCP server)."), TEXT("refuse"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("list_errored_blueprints"),
+		TEXT("Read-only scan of all loaded Blueprints for unresolved compile errors (status==BS_Error && bDisplayCompilePIEWarning) — the exact condition the engine tests before raising its blocking PIE compile-error modal. Returns {count, blueprints:[{name, path}]}. Run this before run_pie_smoke to know whether PIE will be refused / blocked."),
+		FMonolithActionHandler::CreateStatic(&HandleListErroredBlueprints),
+		FParamSchemaBuilder().Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("poll_pie_smoke"),
+		TEXT("Poll an async PIE-smoke session by id. Returns {status (running/complete/stopped/error), elapsed_seconds, sample_count, pie_active, summarized per-var min/max/last, post_marker_counts:{pattern:count}}. When status==complete it includes the full report (all samples + captured frame paths for the clip variant). Does not advance PIE — the editor frame loop does that."),
+		FMonolithActionHandler::CreateStatic(&HandlePollPieSmoke),
+		FParamSchemaBuilder()
+			.Required(TEXT("session_id"), TEXT("string"), TEXT("Session id returned by run_pie_smoke / capture_pie_movement_clip."))
+			.Optional(TEXT("include_samples"), TEXT("bool"), TEXT("If true, include the full per-frame sample array even before completion. Default false (summary only)."), TEXT("false"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("stop_pie_smoke"),
+		TEXT("Force-stop a PIE-smoke session (RequestEndPlayMap + mark stopped) and return its final report. With no session_id, stops ALL running sessions. Also serves as cleanup — the shared frame observer self-unregisters once no sessions remain running."),
+		FMonolithActionHandler::CreateStatic(&HandleStopPieSmoke),
+		FParamSchemaBuilder()
+			.Optional(TEXT("session_id"), TEXT("string"), TEXT("Session to stop. Omit to stop every running session."))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("capture_pie_movement_clip"),
+		TEXT("Start an async PIE-smoke session (same model as run_pie_smoke) that ALSO captures a PIE viewport frame every capture_interval seconds into output_path, plus per-frame AnimInstance sampling. Returns {session_id, status:'running', started:true} immediately; poll_pie_smoke returns the sampled values + captured frame paths. If viewport capture is unavailable during PIE the session continues and poll reports capture_deferred."),
+		FMonolithActionHandler::CreateStatic(&HandleCapturePieMovementClip),
+		FParamSchemaBuilder()
+			.OptionalAssetPath(TEXT("map"), TEXT("Level asset path to load before PIE. Omit to use the current editor level."))
+			.Optional(TEXT("marker"), TEXT("string"), TEXT("Log marker token. Default WARBAND_CLIP."), TEXT("WARBAND_CLIP"))
+			.Optional(TEXT("duration"), TEXT("number"), TEXT("Seconds the editor loop advances PIE before the session auto-completes (clamped 0-120). Default 5."), TEXT("5"))
+			.Optional(TEXT("capture_interval"), TEXT("number"), TEXT("Seconds between captured frames (clamped 0.05-5). Default 0.25."), TEXT("0.25"))
+			.Optional(TEXT("sample_vars"), TEXT("array"), TEXT("AnimInstance variable names sampled each frame. Default [GroundSpeed, bShouldMove, DesiredYawDelta]."))
+			.Optional(TEXT("pawn_class"), TEXT("string"), TEXT("Substring of the target pawn's class name to sample. Omit to use the first player controller's pawn."))
+			.Optional(TEXT("console_script"), TEXT("array"), TEXT("Console commands run on the PIE world at start (drive the movement)."))
+			.Optional(TEXT("python_script"), TEXT("string"), TEXT("Python source run at start."))
+			.OptionalDiskPath(TEXT("output_path"), TEXT("Directory for frame PNGs. Default Saved/Screenshots/Monolith/PieClip/<timestamp>/"))
+			.Optional(TEXT("log_patterns"), TEXT("array"), TEXT("Extra case-insensitive substrings to count after the marker."))
+			.Build());
+
+	// --- Nav harness map builder (F4: warband-harness plan 2026-06-04) ---
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("create_nav_harness_map"),
+		TEXT("Build a navigation test map from a JSON spec: blank UWorld, floor, nav bounds, camera, target points, and BP/actor instances with UPROPERTY defaults (incl. FSoftObjectPath). All spawned actors get a SetFolderPath. Rebuilds + validates nav via runtime `ai` dispatch and saves. Writes to a throwaway map path only."),
+		FMonolithActionHandler::CreateStatic(&HandleCreateNavHarnessMap),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("path"), TEXT("Asset path for the new UWorld (e.g. /Game/Tests/Monolith/Maps/M_NavHarness)."))
+			.Optional(TEXT("floor"), TEXT("object"), TEXT("{location:[x,y,z], scale:[x,y,z], mesh:\"/Engine/BasicShapes/Plane\"}. Omitted = a default 50x50m plane at origin."))
+			.Optional(TEXT("nav_bounds"), TEXT("object"), TEXT("{location:[x,y,z], extent:[x,y,z]} for the NavMeshBoundsVolume. Omitted = bounds sized to the floor."))
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r]} for a spawned ACameraActor."))
+			.Optional(TEXT("target_points"), TEXT("array"), TEXT("[{name:\"start\", location:[x,y,z]}, ...] spawned as ATargetPoint actors; also used as nav validation points."))
+			.Optional(TEXT("actors"), TEXT("array"), TEXT("[{class:\"/Game/.../BP_Foo.BP_Foo_C\", location:[x,y,z], rotation:[p,y,r], folder:\"Harness\", properties:{Prop:value, SoftRefProp:\"/Game/...\"}}, ...]"))
+			.Optional(TEXT("validate_pairs"), TEXT("array"), TEXT("[{from:\"start\", to:\"goal\"}, ...] target-point name pairs that must have a nav path."))
+			.Optional(TEXT("nav_timeout"), TEXT("number"), TEXT("Seconds to wait for nav generation (passed to ai.rebuild_navigation). Default 30."), TEXT("30"))
+			.Build());
 
 	// --- Capture actions ---
 
@@ -1130,20 +1249,85 @@ FMonolithActionResult FMonolithEditorActions::HandleRunConsoleCommand(const TSha
 // ---------------------------------------------------------------------------
 // start_pie / stop_pie — drive Play-In-Editor sessions programmatically
 // ---------------------------------------------------------------------------
-FMonolithActionResult FMonolithEditorActions::HandleStartPIE(const TSharedPtr<FJsonObject>& Params)
+UWorld* FMonolithEditorActions::FindActivePieWorld()
 {
-	if (!GUnrealEd) return FMonolithActionResult::Error(TEXT("GUnrealEd not available"));
-
-	// Reject if a PIE session is already running so we don't queue duplicates.
+	if (!GEditor)
+	{
+		return nullptr;
+	}
 	for (const FWorldContext& Context : GEditor->GetWorldContexts())
 	{
 		if (Context.WorldType == EWorldType::PIE && Context.World())
 		{
-			TSharedPtr<FJsonObject> AlreadyRunning = MakeShared<FJsonObject>();
-			AlreadyRunning->SetBoolField(TEXT("started"), false);
-			AlreadyRunning->SetStringField(TEXT("reason"), TEXT("PIE already running"));
-			return FMonolithActionResult::Success(AlreadyRunning);
+			return Context.World();
 		}
+	}
+	return nullptr;
+}
+
+namespace
+{
+	// One errored Blueprint discovered by the PIE pre-flight scan.
+	struct FErroredBlueprintEntry
+	{
+		FString Name;
+		FString Path;
+	};
+
+	// Scan every loaded UBlueprint for the same condition the engine's
+	// ResolveDirtyBlueprints (PlayLevel.cpp) tests before raising the blocking
+	// "unresolved compiler errors" PIE prompt: status == BS_Error AND the BP still
+	// wants to warn on PIE (bDisplayCompilePIEWarning). Starting PIE on such a world
+	// pops a Slate modal that runs a nested loop on the game thread, starving the
+	// in-process MCP HTTP server until a human clicks.
+	void ScanErroredBlueprints(TArray<FErroredBlueprintEntry>& OutErrored)
+	{
+		for (TObjectIterator<UBlueprint> It; It; ++It)
+		{
+			UBlueprint* Blueprint = *It;
+			if (!IsValid(Blueprint))
+			{
+				continue;
+			}
+			if (Blueprint->Status == BS_Error && Blueprint->bDisplayCompilePIEWarning)
+			{
+				FErroredBlueprintEntry Entry;
+				Entry.Name = Blueprint->GetName();
+				Entry.Path = Blueprint->GetPathName();
+				OutErrored.Add(MoveTemp(Entry));
+			}
+		}
+	}
+
+	// Build a JSON array of {name, path} from a scan result.
+	TArray<TSharedPtr<FJsonValue>> ErroredBlueprintsToJson(const TArray<FErroredBlueprintEntry>& Errored)
+	{
+		TArray<TSharedPtr<FJsonValue>> Items;
+		Items.Reserve(Errored.Num());
+		for (const FErroredBlueprintEntry& Entry : Errored)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetStringField(TEXT("name"), Entry.Name);
+			Obj->SetStringField(TEXT("path"), Entry.Path);
+			Items.Add(MakeShared<FJsonValueObject>(Obj));
+		}
+		return Items;
+	}
+}
+
+bool FMonolithEditorActions::StartPieInternal(FString& OutError, bool bSuppressModals)
+{
+	if (!GUnrealEd)
+	{
+		OutError = TEXT("GUnrealEd not available");
+		return false;
+	}
+
+	// Reject if a PIE session is already running so we don't queue duplicates.
+	if (FindActivePieWorld())
+	{
+		OutError = TEXT("PIE already running");
+		return false;
 	}
 
 	// Pin to in-viewport mode so the action is independent of the user's
@@ -1152,14 +1336,62 @@ FMonolithActionResult FMonolithEditorActions::HandleStartPIE(const TSharedPtr<FJ
 	TSharedPtr<IAssetViewport> ActiveLevelViewport = LevelEditorModule.GetFirstActiveViewport();
 	if (!ActiveLevelViewport.IsValid())
 	{
-		return FMonolithActionResult::Error(TEXT("No active level viewport — cannot pin PIE to in-viewport mode."));
+		OutError = TEXT("No active level viewport — cannot pin PIE to in-viewport mode.");
+		return false;
 	}
 
 	FRequestPlaySessionParams SessionParams;
 	SessionParams.WorldType = EPlaySessionWorldType::PlayInEditor;
 	SessionParams.DestinationSlateViewport = ActiveLevelViewport;
+
+	// In suppress mode, force the unattended-script global true ONLY around the PIE
+	// request. The engine's ShowBlueprintErrorDialog (PlayLevel.cpp) and
+	// FSlateApplication::AddModalWindow both early-out on GIsRunningUnattendedScript,
+	// so the compile-error prompt resolves to its default instead of blocking the
+	// game thread (and with it the in-process MCP server). Self-restoring via RAII;
+	// game-thread only, matching the engine's canonical usage. Not blanket-applied to
+	// all MCP dispatch — only the one call that can trigger the PIE prompt.
+	TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript,
+		bSuppressModals ? true : GIsRunningUnattendedScript);
+
 	GUnrealEd->RequestPlaySession(SessionParams);
 	GUnrealEd->StartQueuedPlaySessionRequest();
+	return true;
+}
+
+bool FMonolithEditorActions::StopPieInternal()
+{
+	if (!GEditor)
+	{
+		return false;
+	}
+
+	const bool bWasRunning = FindActivePieWorld() != nullptr;
+	if (bWasRunning)
+	{
+		GEditor->RequestEndPlayMap();
+	}
+	return bWasRunning;
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleStartPIE(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GUnrealEd) return FMonolithActionResult::Error(TEXT("GUnrealEd not available"));
+
+	// Reject if a PIE session is already running so we don't queue duplicates.
+	if (FindActivePieWorld())
+	{
+		TSharedPtr<FJsonObject> AlreadyRunning = MakeShared<FJsonObject>();
+		AlreadyRunning->SetBoolField(TEXT("started"), false);
+		AlreadyRunning->SetStringField(TEXT("reason"), TEXT("PIE already running"));
+		return FMonolithActionResult::Success(AlreadyRunning);
+	}
+
+	FString StartError;
+	if (!StartPieInternal(StartError))
+	{
+		return FMonolithActionResult::Error(StartError);
+	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("started"), true);
@@ -1171,20 +1403,7 @@ FMonolithActionResult FMonolithEditorActions::HandleStopPIE(const TSharedPtr<FJs
 {
 	if (!GEditor) return FMonolithActionResult::Error(TEXT("GEditor not available"));
 
-	bool bWasRunning = false;
-	for (const FWorldContext& Context : GEditor->GetWorldContexts())
-	{
-		if (Context.WorldType == EWorldType::PIE && Context.World())
-		{
-			bWasRunning = true;
-			break;
-		}
-	}
-
-	if (bWasRunning)
-	{
-		GEditor->RequestEndPlayMap();
-	}
+	const bool bWasRunning = StopPieInternal();
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("stopped"), bWasRunning);
@@ -3370,5 +3589,1254 @@ FMonolithActionResult FMonolithEditorActions::HandleLoadLevel(const TSharedPtr<F
 			? FString::Printf(TEXT("Loaded level '%s'."), *Path)
 			: FString::Printf(TEXT("ULevelEditorSubsystem::LoadLevel returned false for '%s'. Verify the asset exists and is a UWorld."), *Path));
 
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// F1: list_dirty_packages / save_packages — scoped dirty report + scoped saver
+// (warband-harness plan 2026-06-04)
+// ---------------------------------------------------------------------------
+
+namespace MonolithEditorPackages
+{
+	// Read scope_paths into a prefix list. Returns true if any prefixes were given.
+	static bool ParseScopePaths(const TSharedPtr<FJsonObject>& Params, TArray<FString>& OutPrefixes)
+	{
+		OutPrefixes.Reset();
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Params.IsValid() && Params->TryGetArrayField(TEXT("scope_paths"), Arr) && Arr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *Arr)
+			{
+				FString Prefix;
+				if (Val.IsValid() && Val->TryGetString(Prefix) && !Prefix.IsEmpty())
+				{
+					OutPrefixes.Add(Prefix);
+				}
+			}
+		}
+		return OutPrefixes.Num() > 0;
+	}
+
+	static bool MatchesScope(const FString& PackageName, const TArray<FString>& Prefixes)
+	{
+		if (Prefixes.Num() == 0)
+		{
+			return true;
+		}
+		for (const FString& Prefix : Prefixes)
+		{
+			if (PackageName.StartsWith(Prefix))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// A package backs disk content if it has a real /Game (or other mount) name and
+	// is not the transient package. Filters out /Engine/Transient and GC-only objects.
+	static bool IsDiskPackage(const UPackage* Package)
+	{
+		if (!Package || Package == GetTransientPackage())
+		{
+			return false;
+		}
+		if (Package->HasAnyFlags(RF_Transient) || Package->HasAnyPackageFlags(PKG_PlayInEditor))
+		{
+			return false;
+		}
+		const FString Name = Package->GetName();
+		return Name.StartsWith(TEXT("/")) && !Name.StartsWith(TEXT("/Temp/")) &&
+			FPackageName::IsValidLongPackageName(Name);
+	}
+
+	// Collect dirty, on-disk packages matching the scope (and include_transient flag).
+	static void CollectDirtyPackages(const TArray<FString>& ScopePrefixes, bool bIncludeTransient,
+		TArray<UPackage*>& OutPackages)
+	{
+		OutPackages.Reset();
+		ForEachObjectOfClass(UPackage::StaticClass(), [&](UObject* Obj)
+		{
+			UPackage* Package = Cast<UPackage>(Obj);
+			if (!Package || !Package->IsDirty())
+			{
+				return;
+			}
+			if (!bIncludeTransient && !IsDiskPackage(Package))
+			{
+				return;
+			}
+			if (!MatchesScope(Package->GetName(), ScopePrefixes))
+			{
+				return;
+			}
+			OutPackages.Add(Package);
+		}, /*bIncludeDerivedClasses=*/false);
+	}
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleListDirtyPackages(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPackages;
+
+	TArray<FString> ScopePrefixes;
+	ParseScopePaths(Params, ScopePrefixes);
+
+	bool bIncludeTransient = false;
+	if (Params.IsValid()) { Params->TryGetBoolField(TEXT("include_transient"), bIncludeTransient); }
+
+	// Map-vs-content filters default to true (report both kinds) per the F1 plan.
+	bool bIncludeMaps = true;
+	bool bIncludeContent = true;
+	if (Params.IsValid())
+	{
+		Params->TryGetBoolField(TEXT("include_maps"), bIncludeMaps);
+		Params->TryGetBoolField(TEXT("include_content"), bIncludeContent);
+	}
+
+	TArray<UPackage*> DirtyPackages;
+	CollectDirtyPackages(ScopePrefixes, bIncludeTransient, DirtyPackages);
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	for (UPackage* Package : DirtyPackages)
+	{
+		const FString PackageName = Package->GetName();
+		const bool bIsMap = Package->ContainsMap();
+		const bool bIsDisk = IsDiskPackage(Package);
+
+		// Apply the map/content filters before emitting the row.
+		if (bIsMap && !bIncludeMaps)
+		{
+			continue;
+		}
+		if (!bIsMap && !bIncludeContent)
+		{
+			continue;
+		}
+
+		TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("package"), PackageName);
+		Row->SetBoolField(TEXT("is_map"), bIsMap);
+		Row->SetBoolField(TEXT("transient"), !bIsDisk);
+		if (bIsDisk)
+		{
+			const FString Ext = bIsMap ? FPackageName::GetMapPackageExtension()
+									   : FPackageName::GetAssetPackageExtension();
+			FString Filename;
+			if (FPackageName::TryConvertLongPackageNameToFilename(PackageName, Filename, Ext))
+			{
+				Row->SetStringField(TEXT("disk_path"), Filename);
+			}
+		}
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("ok"), true);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	Result->SetArrayField(TEXT("dirty_packages"), Rows);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPackages;
+
+	const TArray<TSharedPtr<FJsonValue>>* PkgArr = nullptr;
+	if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("packages"), PkgArr) || !PkgArr || PkgArr->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: packages (non-empty array of long package names)"));
+	}
+
+	TArray<FString> RequestedNames;
+	for (const TSharedPtr<FJsonValue>& Val : *PkgArr)
+	{
+		FString Name;
+		if (Val.IsValid() && Val->TryGetString(Name) && !Name.IsEmpty())
+		{
+			RequestedNames.AddUnique(Name);
+		}
+	}
+	if (RequestedNames.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("packages array contained no valid package names"));
+	}
+
+	bool bFailOnUnrequested = false;
+	if (Params.IsValid()) { Params->TryGetBoolField(TEXT("fail_on_unrequested_dirty"), bFailOnUnrequested); }
+
+	bool bDryRun = false;
+	if (Params.IsValid()) { Params->TryGetBoolField(TEXT("dry_run"), bDryRun); }
+
+	// Pre-scan: when requested, abort before saving anything if a dirty package
+	// exists outside the request set (bounded by scope_paths if given).
+	if (bFailOnUnrequested)
+	{
+		TArray<FString> ScopePrefixes;
+		ParseScopePaths(Params, ScopePrefixes);
+
+		TArray<UPackage*> DirtyPackages;
+		CollectDirtyPackages(ScopePrefixes, /*bIncludeTransient=*/false, DirtyPackages);
+
+		TArray<FString> Unrequested;
+		for (UPackage* Package : DirtyPackages)
+		{
+			if (!RequestedNames.Contains(Package->GetName()))
+			{
+				Unrequested.Add(Package->GetName());
+			}
+		}
+		if (Unrequested.Num() > 0)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("fail_on_unrequested_dirty: %d dirty package(s) outside the request set: %s"),
+				Unrequested.Num(), *FString::Join(Unrequested, TEXT(", "))));
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	int32 SavedCount = 0;
+	for (const FString& PackageName : RequestedNames)
+	{
+		TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("package"), PackageName);
+
+		UPackage* Package = FindPackage(nullptr, *PackageName);
+		if (!Package)
+		{
+			Package = LoadPackage(nullptr, *PackageName, LOAD_None);
+		}
+		if (!Package)
+		{
+			Row->SetBoolField(TEXT("saved"), false);
+			Row->SetStringField(TEXT("error"), TEXT("package not found / could not be loaded"));
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+			continue;
+		}
+
+		const bool bIsMap = Package->ContainsMap();
+		const FString Ext = bIsMap ? FPackageName::GetMapPackageExtension()
+								   : FPackageName::GetAssetPackageExtension();
+		const FString Filename = FPackageName::LongPackageNameToFilename(PackageName, Ext);
+
+		Row->SetBoolField(TEXT("is_map"), bIsMap);
+		Row->SetStringField(TEXT("disk_path"), Filename);
+
+		if (bDryRun)
+		{
+			// Report intent only — nothing is written. A package "would save" if it is
+			// currently dirty; clean packages are reported as no-op.
+			const bool bWouldSave = Package->IsDirty();
+			Row->SetBoolField(TEXT("would_save"), bWouldSave);
+			Row->SetBoolField(TEXT("dirty"), bWouldSave);
+			if (bWouldSave) { ++SavedCount; }
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+			continue;
+		}
+
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		const bool bSaved = UPackage::SavePackage(Package, nullptr, *Filename, SaveArgs);
+
+		Row->SetBoolField(TEXT("saved"), bSaved);
+		if (bSaved) { ++SavedCount; }
+		else { Row->SetStringField(TEXT("error"), TEXT("UPackage::SavePackage returned false")); }
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("ok"), SavedCount == RequestedNames.Num());
+	Result->SetBoolField(TEXT("dry_run"), bDryRun);
+	Result->SetNumberField(bDryRun ? TEXT("would_save") : TEXT("saved"), SavedCount);
+	Result->SetNumberField(TEXT("requested"), RequestedNames.Num());
+	Result->SetArrayField(TEXT("results"), Rows);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// F2/F3 shared PIE-smoke scaffolding (warband-harness plan 2026-06-04)
+// ---------------------------------------------------------------------------
+
+namespace MonolithEditorPieSmoke
+{
+	// Default post-marker patterns every smoke counts (case-insensitive substring).
+	static const TCHAR* DefaultPatterns[] =
+	{
+		TEXT("Blueprint Runtime Error"),
+		TEXT("Accessed None"),
+		TEXT("LogChooser"),
+	};
+
+	// Resolve the effective pattern set: defaults + any caller-supplied log_patterns.
+	static TArray<FString> ResolvePatterns(const TSharedPtr<FJsonObject>& Params)
+	{
+		TArray<FString> Patterns;
+		for (const TCHAR* P : DefaultPatterns)
+		{
+			Patterns.Add(P);
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Params.IsValid() && Params->TryGetArrayField(TEXT("log_patterns"), Arr) && Arr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *Arr)
+			{
+				FString P;
+				if (Val.IsValid() && Val->TryGetString(P) && !P.IsEmpty())
+				{
+					Patterns.AddUnique(P);
+				}
+			}
+		}
+		return Patterns;
+	}
+
+	// Count, per pattern, how many captured log lines after MarkerTimestamp contain it.
+	static TSharedPtr<FJsonObject> CountPostMarker(FMonolithLogCapture* LogCapture,
+		double MarkerTimestamp, const TArray<FString>& Patterns, int32& OutTotalMatches)
+	{
+		OutTotalMatches = 0;
+		TSharedPtr<FJsonObject> Counts = MakeShared<FJsonObject>();
+		if (!LogCapture)
+		{
+			return Counts;
+		}
+
+		// Pull every captured entry since the marker (broadest verbosity).
+		const TArray<FMonolithLogEntry> Entries = LogCapture->GetEntriesSince(
+			MarkerTimestamp, /*CategoryFilter*/{}, ELogVerbosity::VeryVerbose, FMonolithLogCapture::MaxEntries);
+
+		for (const FString& Pattern : Patterns)
+		{
+			int32 Count = 0;
+			for (const FMonolithLogEntry& Entry : Entries)
+			{
+				const FString CategoryStr = Entry.Category.ToString();
+				if (Entry.Message.Contains(Pattern, ESearchCase::IgnoreCase) ||
+					CategoryStr.Contains(Pattern, ESearchCase::IgnoreCase))
+				{
+					++Count;
+				}
+			}
+			Counts->SetNumberField(Pattern, Count);
+			OutTotalMatches += Count;
+		}
+		return Counts;
+	}
+
+	// Run the caller's optional console + python scripts on the ready PIE world.
+	static void RunScripts(const TSharedPtr<FJsonObject>& Params, UWorld* PieWorld)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ConsoleArr = nullptr;
+		if (Params.IsValid() && Params->TryGetArrayField(TEXT("console_script"), ConsoleArr) && ConsoleArr && PieWorld)
+		{
+			APlayerController* PC = PieWorld->GetFirstPlayerController();
+			for (const TSharedPtr<FJsonValue>& Val : *ConsoleArr)
+			{
+				FString Command;
+				if (Val.IsValid() && Val->TryGetString(Command) && !Command.IsEmpty())
+				{
+					if (PC) { PC->ConsoleCommand(Command, /*bWriteToLog=*/true); }
+					else if (GEngine) { GEngine->Exec(PieWorld, *Command); }
+				}
+			}
+		}
+
+		FString PythonScript;
+		if (Params.IsValid() && Params->TryGetStringField(TEXT("python_script"), PythonScript) && !PythonScript.IsEmpty())
+		{
+			if (IPythonScriptPlugin* Python = IPythonScriptPlugin::Get())
+			{
+				if (Python->IsPythonAvailable())
+				{
+					FPythonCommandEx Cmd;
+					Cmd.Command = PythonScript;
+					Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+					Python->ExecPythonCommandEx(Cmd);
+				}
+			}
+		}
+	}
+
+	// Load the requested map into the editor before PIE (optional). Returns false +
+	// OutError when a map path was given but failed to load.
+	static bool LoadMapIfRequested(const TSharedPtr<FJsonObject>& Params, FString& OutError)
+	{
+		FString MapPath;
+		if (!Params.IsValid() || !Params->TryGetStringField(TEXT("map"), MapPath) || MapPath.IsEmpty())
+		{
+			return true; // No map requested — use the current editor level.
+		}
+		if (!GEditor)
+		{
+			OutError = TEXT("GEditor unavailable — cannot load map for PIE smoke.");
+			return false;
+		}
+		ULevelEditorSubsystem* LevelEd = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+		if (!LevelEd || !LevelEd->LoadLevel(MapPath))
+		{
+			OutError = FString::Printf(TEXT("Failed to load map '%s' for PIE smoke."), *MapPath);
+			return false;
+		}
+		return true;
+	}
+
+	// Resolve the AnimInstance variable names to sample: caller-supplied sample_vars,
+	// or the default GroundSpeed / bShouldMove / DesiredYawDelta set.
+	static TArray<FString> ResolveSampleVars(const TSharedPtr<FJsonObject>& Params)
+	{
+		TArray<FString> Vars;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Params.IsValid() && Params->TryGetArrayField(TEXT("sample_vars"), Arr) && Arr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *Arr)
+			{
+				FString V;
+				if (Val.IsValid() && Val->TryGetString(V) && !V.IsEmpty())
+				{
+					Vars.AddUnique(V);
+				}
+			}
+		}
+		if (Vars.Num() == 0)
+		{
+			Vars = { TEXT("GroundSpeed"), TEXT("bShouldMove"), TEXT("DesiredYawDelta") };
+		}
+		return Vars;
+	}
+
+	static const TCHAR* StatusToString(EPieSmokeStatus Status)
+	{
+		switch (Status)
+		{
+		case EPieSmokeStatus::Running:  return TEXT("running");
+		case EPieSmokeStatus::Complete: return TEXT("complete");
+		case EPieSmokeStatus::Stopped:  return TEXT("stopped");
+		case EPieSmokeStatus::Error:    return TEXT("error");
+		default:                        return TEXT("unknown");
+		}
+	}
+
+	// Build a poll/stop report for a session. When bFull, emit every per-frame sample
+	// (and any captured frame paths); always emit the per-var min/max/last summary and
+	// the post-marker pattern counts.
+	static TSharedPtr<FJsonObject> BuildSessionReport(const FPieSmokeSession& S, bool bFull,
+		FMonolithLogCapture* LogCapture)
+	{
+		TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("session_id"), S.Id);
+		Root->SetStringField(TEXT("status"), StatusToString(S.Status));
+		Root->SetStringField(TEXT("marker"), S.Marker);
+		Root->SetStringField(TEXT("map"), S.MapName);
+		Root->SetNumberField(TEXT("duration"), S.DurationSeconds);
+		Root->SetBoolField(TEXT("pie_active"), S.bPieActive);
+		Root->SetBoolField(TEXT("pie_ready"), S.bReady);
+		Root->SetNumberField(TEXT("sample_count"), S.Samples.Num());
+
+		const double EndTime = (S.Status == EPieSmokeStatus::Running)
+			? FPlatformTime::Seconds() : S.LastObservedSeconds;
+		Root->SetNumberField(TEXT("elapsed_seconds"), FMath::Max(0.0, EndTime - S.StartTimeSeconds));
+
+		if (!S.ErrorReason.IsEmpty())
+		{
+			Root->SetStringField(TEXT("error"), S.ErrorReason);
+		}
+
+		// Per-var summary: min / max / last across all samples.
+		TSharedPtr<FJsonObject> Summary = MakeShared<FJsonObject>();
+		for (const FString& VarName : S.SampleVarNames)
+		{
+			bool bSeen = false;
+			bool bBool = false;
+			double MinV = 0.0, MaxV = 0.0, LastV = 0.0;
+			bool LastBool = false;
+			for (const FPieSmokeSample& Sample : S.Samples)
+			{
+				for (const FPieSmokeSampleVar& Var : Sample.Vars)
+				{
+					if (Var.Name != VarName) { continue; }
+					if (Var.bIsBool)
+					{
+						bBool = true;
+						LastBool = Var.BoolValue;
+						bSeen = true;
+					}
+					else
+					{
+						const double Num = Var.NumberValue;
+						if (!bSeen) { MinV = MaxV = Num; }
+						else { MinV = FMath::Min(MinV, Num); MaxV = FMath::Max(MaxV, Num); }
+						LastV = Num;
+						bSeen = true;
+					}
+				}
+			}
+			if (!bSeen) { continue; }
+			TSharedPtr<FJsonObject> VarObj = MakeShared<FJsonObject>();
+			if (bBool)
+			{
+				VarObj->SetStringField(TEXT("type"), TEXT("bool"));
+				VarObj->SetBoolField(TEXT("last"), LastBool);
+			}
+			else
+			{
+				VarObj->SetStringField(TEXT("type"), TEXT("number"));
+				VarObj->SetNumberField(TEXT("min"), MinV);
+				VarObj->SetNumberField(TEXT("max"), MaxV);
+				VarObj->SetNumberField(TEXT("last"), LastV);
+			}
+			Summary->SetObjectField(VarName, VarObj);
+		}
+		Root->SetObjectField(TEXT("var_summary"), Summary);
+
+		// Clip-variant fields.
+		if (S.bCaptureFrames)
+		{
+			Root->SetStringField(TEXT("output_dir"), S.OutputDir);
+			Root->SetNumberField(TEXT("frame_count"), S.CaptureFrameIndex);
+			if (S.bCaptureDeferred)
+			{
+				Root->SetStringField(TEXT("capture_status"), TEXT("deferred"));
+			}
+			TArray<TSharedPtr<FJsonValue>> Frames;
+			for (const FPieSmokeSample& Sample : S.Samples)
+			{
+				if (!Sample.FramePath.IsEmpty())
+				{
+					Frames.Add(MakeShared<FJsonValueString>(Sample.FramePath));
+				}
+			}
+			Root->SetArrayField(TEXT("frame_paths"), Frames);
+		}
+
+		// Full per-frame sample array (on completion or when explicitly requested).
+		if (bFull)
+		{
+			TArray<TSharedPtr<FJsonValue>> SampleArr;
+			for (const FPieSmokeSample& Sample : S.Samples)
+			{
+				TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
+				SObj->SetNumberField(TEXT("t"), Sample.TimeSeconds);
+				if (!Sample.FramePath.IsEmpty())
+				{
+					SObj->SetStringField(TEXT("frame_path"), Sample.FramePath);
+				}
+				for (const FPieSmokeSampleVar& Var : Sample.Vars)
+				{
+					if (Var.bIsBool) { SObj->SetBoolField(Var.Name, Var.BoolValue); }
+					else { SObj->SetNumberField(Var.Name, Var.NumberValue); }
+				}
+				SampleArr.Add(MakeShared<FJsonValueObject>(SObj));
+			}
+			Root->SetArrayField(TEXT("samples"), SampleArr);
+		}
+
+		// Post-marker pattern counts from the shared log capture.
+		int32 TotalMatches = 0;
+		TSharedPtr<FJsonObject> Counts = CountPostMarker(LogCapture, S.StartTimeSeconds, S.LogPatterns, TotalMatches);
+		Root->SetObjectField(TEXT("post_marker_counts"), Counts);
+		Root->SetNumberField(TEXT("total_matches"), TotalMatches);
+		Root->SetBoolField(TEXT("ok"),
+			(S.Status == EPieSmokeStatus::Complete) && S.bReady && TotalMatches == 0);
+
+		return Root;
+	}
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleRunPieSmoke(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPieSmoke;
+
+	if (!GEditor || !GUnrealEd)
+	{
+		return FMonolithActionResult::Error(TEXT("run_pie_smoke requires editor context (GEditor/GUnrealEd)."));
+	}
+	if (FindActivePieWorld())
+	{
+		return FMonolithActionResult::Error(TEXT("A PIE session is already running — stop it before run_pie_smoke."));
+	}
+
+	FString Marker = TEXT("WARBAND_SMOKE");
+	Params->TryGetStringField(TEXT("marker"), Marker);
+
+	double Duration = 5.0;
+	if (Params->HasField(TEXT("duration"))) { Duration = Params->GetNumberField(TEXT("duration")); }
+	Duration = FMath::Clamp(Duration, 0.0, 120.0);
+
+	// Compile-error policy: "refuse" (default, safe) returns an error + the offending
+	// Blueprints and never starts PIE; "suppress" proceeds and silences the engine's
+	// blocking compile-error prompt via the StartPieInternal unattended guard.
+	FString CompileMode = TEXT("refuse");
+	Params->TryGetStringField(TEXT("on_compile_errors"), CompileMode);
+	const bool bSuppressModals = CompileMode.Equals(TEXT("suppress"), ESearchCase::IgnoreCase);
+
+	// Optional map load before PIE.
+	FString LoadError;
+	if (!LoadMapIfRequested(Params, LoadError))
+	{
+		return FMonolithActionResult::Error(LoadError);
+	}
+
+	// PIE pre-flight: scan for errored Blueprints AFTER any map load (the loaded level
+	// brings its own Blueprints into memory). In refuse mode, never PIE a broken world —
+	// a compile-error modal would run a nested game-thread loop and strangle the MCP server.
+	{
+		TArray<FErroredBlueprintEntry> Errored;
+		ScanErroredBlueprints(Errored);
+		if (Errored.Num() > 0 && !bSuppressModals)
+		{
+			TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
+			ErrObj->SetNumberField(TEXT("errored_blueprint_count"), Errored.Num());
+			ErrObj->SetArrayField(TEXT("errored_blueprints"), ErroredBlueprintsToJson(Errored));
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("run_pie_smoke refused: %d Blueprint(s) have unresolved compile errors. ")
+					TEXT("Starting PIE would raise a blocking modal that freezes the editor + MCP server. ")
+					TEXT("Fix the Blueprints, or pass on_compile_errors=\"suppress\" to PIE anyway."),
+					Errored.Num()))
+				.WithErrorData(ErrObj);
+		}
+	}
+
+	// Start PIE synchronously (the start request itself is safe inside the handler —
+	// the re-entrancy crash was the OLD pump driving UWorld/GEditor::Tick afterwards;
+	// that work now happens on the editor's real frames via the session observer).
+	// bSuppressModals wraps the request in the unattended guard so a compile-error
+	// prompt resolves to its default instead of blocking.
+	FString StartError;
+	if (!StartPieInternal(StartError, bSuppressModals))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to start PIE: %s"), *StartError));
+	}
+
+	// Emit the marker now; the observer counts only post-marker log lines. PIE may not
+	// have run BeginPlay yet — the observer waits for HasBegunPlay before sampling.
+	UWorld* PieWorld = FindActivePieWorld();
+	UE_LOG(LogMonolith, Display, TEXT("%s begin (map=%s)"), *Marker,
+		PieWorld ? *PieWorld->GetMapName() : TEXT("<current>"));
+
+	// Optional console / python scripts run once at start (best-effort).
+	if (PieWorld)
+	{
+		RunScripts(Params, PieWorld);
+	}
+
+	// Register the async session — the editor frame loop advances it from here.
+	FPieSmokeSession Session;
+	Session.StartTimeSeconds = FPlatformTime::Seconds();
+	Session.DurationSeconds = Duration;
+	Session.Marker = Marker;
+	Session.MapName = PieWorld ? PieWorld->GetMapName() : TEXT("<current>");
+	Session.LogPatterns = ResolvePatterns(Params);
+	Session.SampleVarNames = ResolveSampleVars(Params);
+	Params->TryGetStringField(TEXT("pawn_class"), Session.PawnClassFilter);
+
+	const FString SessionId = FPieSmokeSessionManager::Get().CreateSession(MoveTemp(Session));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("session_id"), SessionId);
+	Result->SetStringField(TEXT("status"), TEXT("running"));
+	Result->SetBoolField(TEXT("started"), true);
+	Result->SetStringField(TEXT("marker"), Marker);
+	Result->SetNumberField(TEXT("duration"), Duration);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// poll_pie_smoke / stop_pie_smoke — read progress / force-end an async session
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithEditorActions::HandlePollPieSmoke(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPieSmoke;
+
+	FString SessionId;
+	if (!Params->TryGetStringField(TEXT("session_id"), SessionId) || SessionId.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("poll_pie_smoke requires a session_id."));
+	}
+
+	FPieSmokeSessionManager& Mgr = FPieSmokeSessionManager::Get();
+	FPieSmokeSession* Session = Mgr.Find(SessionId);
+	if (!Session)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown PIE-smoke session '%s'."), *SessionId));
+	}
+
+	bool bIncludeSamples = false;
+	Params->TryGetBoolField(TEXT("include_samples"), bIncludeSamples);
+	const bool bFull = bIncludeSamples || (Session->Status != EPieSmokeStatus::Running);
+
+	return FMonolithActionResult::Success(
+		BuildSessionReport(*Session, bFull, Mgr.GetLogCapture()));
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleStopPieSmoke(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPieSmoke;
+
+	FString SessionId;
+	Params->TryGetStringField(TEXT("session_id"), SessionId); // empty => stop all
+
+	FPieSmokeSessionManager& Mgr = FPieSmokeSessionManager::Get();
+	const int32 Stopped = Mgr.Stop(SessionId);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("stopped"), Stopped);
+
+	if (!SessionId.IsEmpty())
+	{
+		if (FPieSmokeSession* Session = Mgr.Find(SessionId))
+		{
+			Result->SetObjectField(TEXT("report"),
+				BuildSessionReport(*Session, /*bFull=*/true, Mgr.GetLogCapture()));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("warning"),
+				FString::Printf(TEXT("Unknown session '%s' — nothing to stop."), *SessionId));
+		}
+	}
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// list_errored_blueprints — read-only PIE pre-flight scan
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithEditorActions::HandleListErroredBlueprints(const TSharedPtr<FJsonObject>& Params)
+{
+	TArray<FErroredBlueprintEntry> Errored;
+	ScanErroredBlueprints(Errored);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("count"), Errored.Num());
+	Result->SetArrayField(TEXT("blueprints"), ErroredBlueprintsToJson(Errored));
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// F3: capture_pie_movement_clip — async session + per-interval frame capture +
+// AnimInstance sampling (warband-harness plan 2026-06-04)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithEditorActions::HandleCapturePieMovementClip(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorPieSmoke;
+
+	if (!GEditor || !GUnrealEd)
+	{
+		return FMonolithActionResult::Error(TEXT("capture_pie_movement_clip requires editor context (GEditor/GUnrealEd)."));
+	}
+	if (FindActivePieWorld())
+	{
+		return FMonolithActionResult::Error(TEXT("A PIE session is already running — stop it before capture_pie_movement_clip."));
+	}
+
+	FString Marker = TEXT("WARBAND_CLIP");
+	Params->TryGetStringField(TEXT("marker"), Marker);
+
+	double Duration = 5.0;
+	if (Params->HasField(TEXT("duration"))) { Duration = Params->GetNumberField(TEXT("duration")); }
+	Duration = FMath::Clamp(Duration, 0.0, 120.0);
+
+	double Interval = 0.25;
+	if (Params->HasField(TEXT("capture_interval"))) { Interval = Params->GetNumberField(TEXT("capture_interval")); }
+	Interval = FMath::Clamp(Interval, 0.05, 5.0);
+
+	FString OutputDir;
+	if (Params->HasField(TEXT("output_path")))
+	{
+		OutputDir = Params->GetStringField(TEXT("output_path"));
+		if (FPaths::IsRelative(OutputDir)) { OutputDir = FPaths::ProjectDir() / OutputDir; }
+	}
+	else
+	{
+		const FString Stamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+		OutputDir = FPaths::ProjectDir() / TEXT("Saved/Screenshots/Monolith/PieClip") / Stamp;
+	}
+
+	FString LoadError;
+	if (!LoadMapIfRequested(Params, LoadError))
+	{
+		return FMonolithActionResult::Error(LoadError);
+	}
+
+	// Start PIE synchronously (safe — see HandleRunPieSmoke). Frame capture + sampling
+	// run on the editor's real frames via the session observer.
+	FString StartError;
+	if (!StartPieInternal(StartError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to start PIE: %s"), *StartError));
+	}
+
+	UWorld* PieWorld = FindActivePieWorld();
+	UE_LOG(LogMonolith, Display, TEXT("%s begin"), *Marker);
+	if (PieWorld)
+	{
+		RunScripts(Params, PieWorld);
+	}
+
+	FPieSmokeSession Session;
+	Session.StartTimeSeconds = FPlatformTime::Seconds();
+	Session.DurationSeconds = Duration;
+	Session.Marker = Marker;
+	Session.MapName = PieWorld ? PieWorld->GetMapName() : TEXT("<current>");
+	Session.LogPatterns = ResolvePatterns(Params);
+	Session.SampleVarNames = ResolveSampleVars(Params);
+	Params->TryGetStringField(TEXT("pawn_class"), Session.PawnClassFilter);
+	Session.bCaptureFrames = true;
+	Session.CaptureInterval = Interval;
+	Session.OutputDir = OutputDir;
+
+	const FString SessionId = FPieSmokeSessionManager::Get().CreateSession(MoveTemp(Session));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("session_id"), SessionId);
+	Result->SetStringField(TEXT("status"), TEXT("running"));
+	Result->SetBoolField(TEXT("started"), true);
+	Result->SetStringField(TEXT("marker"), Marker);
+	Result->SetStringField(TEXT("output_dir"), OutputDir);
+	Result->SetNumberField(TEXT("duration"), Duration);
+	Result->SetNumberField(TEXT("capture_interval"), Interval);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// F4: create_nav_harness_map — build a nav test map from a JSON spec
+// (warband-harness plan 2026-06-04)
+//
+// Nav rebuild + validation are delegated to the registered `ai` actions via
+// runtime string dispatch (FMonolithToolRegistry::ExecuteAction) so MonolithEditor
+// takes NO compile-time dependency on MonolithAI / the NavigationSystem module.
+// ---------------------------------------------------------------------------
+
+namespace MonolithEditorNavHarness
+{
+	// Parse a [x,y,z] (or {x,y,z}) JSON value into an FVector. Returns false if absent.
+	static bool ParseVec3(const TSharedPtr<FJsonObject>& Obj, const FString& Field, FVector& OutVec)
+	{
+		if (!Obj.IsValid() || !Obj->HasField(Field))
+		{
+			return false;
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Obj->TryGetArrayField(Field, Arr) && Arr && Arr->Num() >= 3)
+		{
+			OutVec = FVector((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+			return true;
+		}
+		const TSharedPtr<FJsonObject>* SubObj = nullptr;
+		if (Obj->TryGetObjectField(Field, SubObj) && SubObj && (*SubObj)->Values.Num() >= 3)
+		{
+			OutVec = FVector((*SubObj)->GetNumberField(TEXT("x")),
+							 (*SubObj)->GetNumberField(TEXT("y")),
+							 (*SubObj)->GetNumberField(TEXT("z")));
+			return true;
+		}
+		return false;
+	}
+
+	static TArray<TSharedPtr<FJsonValue>> Vec3ToJson(const FVector& V)
+	{
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		Arr.Add(MakeShared<FJsonValueNumber>(V.X));
+		Arr.Add(MakeShared<FJsonValueNumber>(V.Y));
+		Arr.Add(MakeShared<FJsonValueNumber>(V.Z));
+		return Arr;
+	}
+
+	// Apply a JSON "properties" object onto a spawned actor reflectively. Supports
+	// float/double, int, bool, string/name, and FSoftObjectPath (string value).
+	// Unknown / unsupported properties are recorded in OutSkipped, never fatal.
+	static void ApplyProperties(AActor* Actor, const TSharedPtr<FJsonObject>& PropObj, TArray<FString>& OutApplied, TArray<FString>& OutSkipped)
+	{
+		if (!Actor || !PropObj.IsValid())
+		{
+			return;
+		}
+		for (const auto& Pair : PropObj->Values)
+		{
+			const FString& PropName = Pair.Key;
+			const TSharedPtr<FJsonValue>& Value = Pair.Value;
+			FProperty* Prop = Actor->GetClass()->FindPropertyByName(FName(*PropName));
+			if (!Prop)
+			{
+				OutSkipped.Add(PropName + TEXT(" (not found)"));
+				continue;
+			}
+			void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Actor);
+
+			if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+			{
+				FloatProp->SetPropertyValue(ValuePtr, Value->AsNumber());
+			}
+			else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+			{
+				DoubleProp->SetPropertyValue(ValuePtr, Value->AsNumber());
+			}
+			else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+			{
+				IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Value->AsNumber()));
+			}
+			else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+			{
+				BoolProp->SetPropertyValue(ValuePtr, Value->AsBool());
+			}
+			else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+			{
+				StrProp->SetPropertyValue(ValuePtr, Value->AsString());
+			}
+			else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+			{
+				NameProp->SetPropertyValue(ValuePtr, FName(*Value->AsString()));
+			}
+			else if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+			{
+				// FSoftObjectPath (and any string-importable struct) goes through the
+				// reflection text importer — same pattern as MonolithMaterialActions.
+				if (StructProp->Struct == TBaseStructure<FSoftObjectPath>::Get())
+				{
+					const FString PathStr = Value->AsString();
+					Prop->ImportText_Direct(*PathStr, ValuePtr, Actor, PPF_None);
+				}
+				else
+				{
+					OutSkipped.Add(PropName + TEXT(" (unsupported struct ") + StructProp->Struct->GetName() + TEXT(")"));
+					continue;
+				}
+			}
+			else if (CastField<FSoftObjectProperty>(Prop) || CastField<FObjectProperty>(Prop))
+			{
+				// Asset reference by path string (e.g. an animation DB or mesh).
+				const FString PathStr = Value->AsString();
+				Prop->ImportText_Direct(*PathStr, ValuePtr, Actor, PPF_None);
+			}
+			else
+			{
+				OutSkipped.Add(PropName + TEXT(" (unsupported type ") + Prop->GetClass()->GetName() + TEXT(")"));
+				continue;
+			}
+			OutApplied.Add(PropName);
+		}
+	}
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleCreateNavHarnessMap(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorNavHarness;
+
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("create_nav_harness_map requires editor context (GEditor)."));
+	}
+
+	FString MapPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("path"), MapPath) || MapPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: path"));
+	}
+
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+
+	// 1. Create the blank UWorld via the existing editor.create_empty_map action,
+	//    then load it as the active editor world so spawns + nav target it.
+	{
+		TSharedPtr<FJsonObject> CreateParams = MakeShared<FJsonObject>();
+		CreateParams->SetStringField(TEXT("path"), MapPath);
+		const FMonolithActionResult CreateRes = Registry.ExecuteAction(TEXT("editor"), TEXT("create_empty_map"), CreateParams);
+		if (!CreateRes.bSuccess)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("create_empty_map failed: %s"), *CreateRes.ErrorMessage));
+		}
+	}
+
+	ULevelEditorSubsystem* LevelEd = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+	if (!LevelEd || !LevelEd->LoadLevel(MapPath))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Created map but failed to load '%s' as the editor world."), *MapPath));
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world after loading the harness map."));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> SpawnedActors;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	// 2. Floor — default 50x50m plane unless overridden.
+	{
+		FVector FloorLoc = FVector::ZeroVector;
+		FVector FloorScale(50.0f, 50.0f, 1.0f);
+		FString FloorMeshPath = TEXT("/Engine/BasicShapes/Plane.Plane");
+
+		const TSharedPtr<FJsonObject>* FloorObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("floor"), FloorObj) && FloorObj)
+		{
+			ParseVec3(*FloorObj, TEXT("location"), FloorLoc);
+			ParseVec3(*FloorObj, TEXT("scale"), FloorScale);
+			FString MeshOverride;
+			if ((*FloorObj)->TryGetStringField(TEXT("mesh"), MeshOverride) && !MeshOverride.IsEmpty())
+			{
+				FloorMeshPath = MeshOverride;
+			}
+		}
+
+		AStaticMeshActor* Floor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), FloorLoc, FRotator::ZeroRotator, SpawnParams);
+		if (Floor)
+		{
+			if (UStaticMeshComponent* FloorComp = Floor->GetStaticMeshComponent())
+			{
+				FloorComp->SetMobility(EComponentMobility::Static);
+				if (UStaticMesh* FloorMesh = LoadObject<UStaticMesh>(nullptr, *FloorMeshPath))
+				{
+					FloorComp->SetStaticMesh(FloorMesh);
+				}
+			}
+			Floor->SetActorScale3D(FloorScale);
+			Floor->SetActorLabel(TEXT("Harness_Floor"));
+			Floor->SetFolderPath(TEXT("Harness"));
+			Floor->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("kind"), TEXT("floor"));
+			Row->SetStringField(TEXT("name"), Floor->GetActorNameOrLabel());
+			SpawnedActors.Add(MakeShared<FJsonValueObject>(Row));
+		}
+	}
+
+	// 3. Camera (optional).
+	{
+		const TSharedPtr<FJsonObject>* CamObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("camera"), CamObj) && CamObj)
+		{
+			FVector CamLoc(0.0f, 0.0f, 1000.0f);
+			FVector CamRot(-60.0f, 0.0f, 0.0f);
+			ParseVec3(*CamObj, TEXT("location"), CamLoc);
+			ParseVec3(*CamObj, TEXT("rotation"), CamRot);
+
+			ACameraActor* Cam = World->SpawnActor<ACameraActor>(ACameraActor::StaticClass(), CamLoc,
+				FRotator(CamRot.X, CamRot.Y, CamRot.Z), SpawnParams);
+			if (Cam)
+			{
+				Cam->SetActorLabel(TEXT("Harness_Camera"));
+				Cam->SetFolderPath(TEXT("Harness"));
+				Cam->MarkPackageDirty();
+
+				TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+				Row->SetStringField(TEXT("kind"), TEXT("camera"));
+				Row->SetStringField(TEXT("name"), Cam->GetActorNameOrLabel());
+				SpawnedActors.Add(MakeShared<FJsonValueObject>(Row));
+			}
+		}
+	}
+
+	// 4. Target points (also feed nav validation).
+	TArray<TSharedPtr<FJsonValue>> NavPoints;
+	{
+		const TArray<TSharedPtr<FJsonValue>>* TpArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("target_points"), TpArr) && TpArr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *TpArr)
+			{
+				const TSharedPtr<FJsonObject> TpObj = Val.IsValid() ? Val->AsObject() : nullptr;
+				if (!TpObj.IsValid())
+				{
+					continue;
+				}
+				FString Name;
+				TpObj->TryGetStringField(TEXT("name"), Name);
+				FVector Loc = FVector::ZeroVector;
+				ParseVec3(TpObj, TEXT("location"), Loc);
+
+				ATargetPoint* Tp = World->SpawnActor<ATargetPoint>(ATargetPoint::StaticClass(), Loc, FRotator::ZeroRotator, SpawnParams);
+				if (Tp)
+				{
+					if (!Name.IsEmpty()) { Tp->SetActorLabel(Name); }
+					Tp->SetFolderPath(TEXT("Harness/Targets"));
+					Tp->MarkPackageDirty();
+
+					TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+					Row->SetStringField(TEXT("kind"), TEXT("target_point"));
+					Row->SetStringField(TEXT("name"), Tp->GetActorNameOrLabel());
+					SpawnedActors.Add(MakeShared<FJsonValueObject>(Row));
+
+					// Mirror into the nav-validation point list.
+					TSharedPtr<FJsonObject> NavPt = MakeShared<FJsonObject>();
+					NavPt->SetStringField(TEXT("name"), Name.IsEmpty() ? Tp->GetActorNameOrLabel() : Name);
+					NavPt->SetArrayField(TEXT("location"), Vec3ToJson(Loc));
+					NavPoints.Add(MakeShared<FJsonValueObject>(NavPt));
+				}
+			}
+		}
+	}
+
+	// 5. Actor instances with BP class paths + reflective UPROPERTY defaults.
+	TArray<TSharedPtr<FJsonValue>> ActorReports;
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ActorsArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("actors"), ActorsArr) && ActorsArr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *ActorsArr)
+			{
+				const TSharedPtr<FJsonObject> ActorObj = Val.IsValid() ? Val->AsObject() : nullptr;
+				if (!ActorObj.IsValid())
+				{
+					continue;
+				}
+				FString ClassPath;
+				if (!ActorObj->TryGetStringField(TEXT("class"), ClassPath) || ClassPath.IsEmpty())
+				{
+					continue;
+				}
+
+				UClass* ActorClass = LoadClass<AActor>(nullptr, *ClassPath);
+				if (!ActorClass)
+				{
+					// Tolerate _C-suffix omission by trying the generated-class path.
+					ActorClass = LoadObject<UClass>(nullptr, *ClassPath);
+				}
+
+				TSharedPtr<FJsonObject> ActorRow = MakeShared<FJsonObject>();
+				ActorRow->SetStringField(TEXT("class"), ClassPath);
+				if (!ActorClass)
+				{
+					ActorRow->SetBoolField(TEXT("spawned"), false);
+					ActorRow->SetStringField(TEXT("error"), TEXT("could not resolve actor class"));
+					ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+					continue;
+				}
+
+				FVector Loc = FVector::ZeroVector;
+				FVector Rot = FVector::ZeroVector;
+				ParseVec3(ActorObj, TEXT("location"), Loc);
+				ParseVec3(ActorObj, TEXT("rotation"), Rot);
+
+				AActor* Spawned = World->SpawnActor<AActor>(ActorClass, Loc,
+					FRotator(Rot.X, Rot.Y, Rot.Z), SpawnParams);
+				if (!Spawned)
+				{
+					ActorRow->SetBoolField(TEXT("spawned"), false);
+					ActorRow->SetStringField(TEXT("error"), TEXT("SpawnActor returned null"));
+					ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+					continue;
+				}
+
+				FString Folder = TEXT("Harness/Actors");
+				ActorObj->TryGetStringField(TEXT("folder"), Folder);
+				Spawned->SetFolderPath(FName(*Folder));
+
+				TArray<FString> Applied, Skipped;
+				const TSharedPtr<FJsonObject>* PropObj = nullptr;
+				if (ActorObj->TryGetObjectField(TEXT("properties"), PropObj) && PropObj)
+				{
+					ApplyProperties(Spawned, *PropObj, Applied, Skipped);
+				}
+				Spawned->MarkPackageDirty();
+
+				ActorRow->SetBoolField(TEXT("spawned"), true);
+				ActorRow->SetStringField(TEXT("name"), Spawned->GetActorNameOrLabel());
+				ActorRow->SetNumberField(TEXT("properties_applied"), Applied.Num());
+				if (Skipped.Num() > 0)
+				{
+					TArray<TSharedPtr<FJsonValue>> SkippedJson;
+					for (const FString& S : Skipped) { SkippedJson.Add(MakeShared<FJsonValueString>(S)); }
+					ActorRow->SetArrayField(TEXT("properties_skipped"), SkippedJson);
+				}
+				ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+			}
+		}
+	}
+
+	// 6. Nav bounds — default sized to the floor footprint unless overridden.
+	{
+		FVector NavLoc = FVector::ZeroVector;
+		FVector NavExtent(3000.0f, 3000.0f, 500.0f);
+		const TSharedPtr<FJsonObject>* NavObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("nav_bounds"), NavObj) && NavObj)
+		{
+			ParseVec3(*NavObj, TEXT("location"), NavLoc);
+			ParseVec3(*NavObj, TEXT("extent"), NavExtent);
+		}
+
+		TSharedPtr<FJsonObject> NavParams = MakeShared<FJsonObject>();
+		NavParams->SetArrayField(TEXT("location"), Vec3ToJson(NavLoc));
+		NavParams->SetArrayField(TEXT("extent"), Vec3ToJson(NavExtent));
+		NavParams->SetStringField(TEXT("folder_path"), TEXT("Harness/Navigation"));
+		const FMonolithActionResult NavRes = Registry.ExecuteAction(TEXT("ai"), TEXT("add_nav_bounds_volume"), NavParams);
+		Result->SetBoolField(TEXT("nav_bounds_added"), NavRes.bSuccess);
+		if (!NavRes.bSuccess)
+		{
+			Result->SetStringField(TEXT("nav_bounds_error"), NavRes.ErrorMessage);
+		}
+	}
+
+	// 7. Rebuild navigation (delegated to ai.rebuild_navigation, which bound-waits
+	//    for async tile generation).
+	{
+		double NavTimeout = 30.0;
+		if (Params->HasField(TEXT("nav_timeout"))) { NavTimeout = Params->GetNumberField(TEXT("nav_timeout")); }
+
+		TSharedPtr<FJsonObject> RebuildParams = MakeShared<FJsonObject>();
+		RebuildParams->SetBoolField(TEXT("save_after"), false); // we save the level explicitly below
+		RebuildParams->SetNumberField(TEXT("timeout_seconds"), NavTimeout);
+		const FMonolithActionResult RebuildRes = Registry.ExecuteAction(TEXT("ai"), TEXT("rebuild_navigation"), RebuildParams);
+		Result->SetBoolField(TEXT("nav_rebuilt"), RebuildRes.bSuccess);
+		if (RebuildRes.bSuccess && RebuildRes.Result.IsValid())
+		{
+			Result->SetObjectField(TEXT("nav_rebuild"), RebuildRes.Result);
+		}
+		else if (!RebuildRes.bSuccess)
+		{
+			Result->SetStringField(TEXT("nav_rebuild_error"), RebuildRes.ErrorMessage);
+		}
+	}
+
+	// 8. Validate nav points + requested path pairs (delegated to ai.validate_nav_points).
+	if (NavPoints.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> ValidateParams = MakeShared<FJsonObject>();
+		ValidateParams->SetArrayField(TEXT("points"), NavPoints);
+		const TArray<TSharedPtr<FJsonValue>>* PairsArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("validate_pairs"), PairsArr) && PairsArr)
+		{
+			ValidateParams->SetArrayField(TEXT("require_path_pairs"), *PairsArr);
+		}
+		const FMonolithActionResult ValidateRes = Registry.ExecuteAction(TEXT("ai"), TEXT("validate_nav_points"), ValidateParams);
+		Result->SetBoolField(TEXT("nav_validated"), ValidateRes.bSuccess);
+		if (ValidateRes.Result.IsValid())
+		{
+			Result->SetObjectField(TEXT("nav_validation"), ValidateRes.Result);
+		}
+		else if (!ValidateRes.bSuccess)
+		{
+			Result->SetStringField(TEXT("nav_validation_error"), ValidateRes.ErrorMessage);
+		}
+	}
+
+	// 9. Save the level package now that actors + nav exist.
+	{
+		TSharedPtr<FJsonObject> SaveParams = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PkgArr;
+		PkgArr.Add(MakeShared<FJsonValueString>(MapPath));
+		SaveParams->SetArrayField(TEXT("packages"), PkgArr);
+		const FMonolithActionResult SaveRes = Registry.ExecuteAction(TEXT("editor"), TEXT("save_packages"), SaveParams);
+		Result->SetBoolField(TEXT("saved"), SaveRes.bSuccess);
+		if (!SaveRes.bSuccess)
+		{
+			Result->SetStringField(TEXT("save_error"), SaveRes.ErrorMessage);
+		}
+	}
+
+	Result->SetBoolField(TEXT("ok"), true);
+	Result->SetStringField(TEXT("path"), MapPath);
+	Result->SetArrayField(TEXT("spawned_actors"), SpawnedActors);
+	Result->SetArrayField(TEXT("actor_instances"), ActorReports);
 	return FMonolithActionResult::Success(Result);
 }

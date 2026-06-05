@@ -14,15 +14,15 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 125 animation actions across `MonolithAnimationActions.cpp` (103), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1) |
+| `FMonolithAnimationModule` | Registers 130 animation actions across `MonolithAnimationActions.cpp` (103), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`) |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups (the original action handlers) |
 | `FMonolithAbpWriteActions` | ABP graph write actions (Phase v0.14.3 PR #34): `add_anim_graph_node` (built-in aliases plus generic `UAnimGraphNode_Base` class path/name resolution, with TwoBoneIK / ModifyBone helpers and auto-pin exposure), `connect_anim_graph_pins`, `set_state_animation`, `add_variable_get`, `set_anim_graph_node_property` |
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
 | `FMonolithAnimLayoutActions` | `auto_layout` for AnimBP graphs |
 
-### Actions (125 — namespace: "animation")
+### Actions (130 — namespace: "animation")
 
-**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **22 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125 (103 baseline + 22 wave-actions).
+**Note (2026-04-26 audit):** The detailed per-category tables below cover the 103 baseline actions. The remaining **27 actions** (5 ABP write + 13 PoseSearch + 3 ControlRig + 1 layout + 5 graph-surgery) are documented in their own sections at the bottom of this spec. The ABP write actions landed in v0.14.3 (PR #34 by @MaxenceEpitech). No Phase J changes touched this module. v0.14.9 added `copy_bone_pose_between_sequences` (PR #51 by @MaxenceEpitech). v0.14.10 added `list_bone_tracks` (PR #54 by @MaxenceEpitech) and rewrote `get_bone_track_keys` to use the non-deprecated `IsValidBoneTrackName` + `GetBoneTrackTransforms` API path. v0.14.10 also added `get_skeleton_preview_attached_assets` + `get_bone_ref_pose` (PR #55 by @MaxenceEpitech) and the three `CompatibleSkeletons` actions (`get_compatible_skeletons` / `add_compatible_skeleton` / `remove_compatible_skeleton` — PR #56 by @MaxenceEpitech), bringing the module total to 125. The Warband Harness Wave 2 added the 5 graph-surgery actions, bringing the module total to 130 (103 baseline + 27 wave-actions).
 
 **Sequence Info (5) — read-only**
 | Action | Description |
@@ -176,6 +176,18 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 |--------|-------------|
 | `auto_layout` | Auto-arrange nodes in an Animation Blueprint graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in hierarchical layout; `"blueprint_assist"` — requires BA; `"builtin"` — built-in only. Optional `graph_name` to target a specific graph |
 
+**Graph Surgery (5) — Warband Harness Wave 2**
+
+Node-level write operations over Animation Blueprint graphs, built for reparenting and Chooser-node rewiring during the Warband recruit-ABP pipeline. The two batch / reparent / slice-removal actions default to `dry_run=true`.
+
+| Action | Description |
+|--------|-------------|
+| `rebuild_evaluate_chooser_node` | Delete and reflectively respawn a `UK2Node_EvaluateChooser2` (class resolved as `/Script/ChooserUncooked.K2Node_EvaluateChooser2`), regenerating pins from a target `UChooserTable`. Reconnects compatible pins through the graph schema (`CanCreateConnection` / `TryCreateConnection`), coercing reroute / `Knot` wildcard pins. Compile-checks the result and never auto-saves on a failed compile. |
+| `replace_evaluate_chooser_nodes` | Batch `rebuild_evaluate_chooser_node` across every Evaluate-Chooser node in an ABP. `dry_run` defaults to `true`. |
+| `duplicate_reparent_and_sanitize` | Duplicate an ABP and reparent it to `new_parent_class`, then classify every node against the new parent's reflected surface into `safe` / `requires_guard` / `requires_rebuild` / `remove_for_smoke` (node kinds: cast, variable_get, function-call, Evaluate-Chooser). A self-context `variable_get` is classified `safe` when its variable exists on the new parent OR is defined locally on the duplicate (locals survive reparenting); `requires_guard` only when neither holds. `dry_run` defaults to `true`. |
+| `find_node_slice` | Compute a directional (`upstream` / `downstream`) node slice from a seed node, honoring `stop_rules`. Reports the slice set, before/after node counts, and orphaned pins. Read-only. |
+| `remove_node_slice` | Remove a directional node slice. Reports counts, orphaned pins, and any broken required-exec continuity — surfaced in the response, never auto-rewired. `dry_run` defaults to `true`. |
+
 ### Bulk Fill & Describe Surface (2026-05-11)
 
 `MonolithAnimationBulkFillAdapter` registers under `FMonolithBulkFillRegistry` for the `animation` namespace, exposed via the framework-level `bulk_fill_query("apply", ...)` and `describe_query("schema", ...)` dispatchers. Phase 5 of the MCP ergonomics rollout (design spec `Docs/plans/2026-05-11-monolith-mcp-ergonomics-design.md`).
@@ -211,7 +223,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 
 - **`FPoseSearchDatabaseAnimationAsset` is a unified 5.7 shape.** UE 5.7 collapsed prior per-asset-type containers into a single discriminated struct. The adapter routes per-row writes via the discriminator (the first of `sequence` / `blendspace` / `composite` / `montage` present in each row). Schema surfaces the discriminator under `entries[].asset_type` with the four valid values.
 - **`IAnimationDataController` requires bracket transactions.** Sequence-level writes (notify CRUD, curve CRUD, bone-track CRUD) must open / close an `IAnimationDataController` transaction. The PoseSearchDatabase fill_kind does NOT touch sequence-level transactions (it writes to the database asset directly); notify/curve fill_kinds would, hence they remain `(WISHLIST v1.1)`.
-- **CHT_ chooser-table has NO MCP surface — `(WISHLIST)`.** Chooser tables are not in the animation_query action surface and not in bulk_fill v1. Per the first-fanout Appendix A row "Chooser table (CHT_) population not in animation_query".
+- **CHT_ chooser-table read/edit surface lives in the `chooser` namespace, not `animation`.** Chooser tables (`UChooserTable`) are inspected and edited via the dedicated `chooser` namespace (`inspect_chooser`, `duplicate_chooser_tree`, `set_context_object_class`, `set_result_asset_reference`, `validate_chooser` — all `#if WITH_CHOOSER` gated; see `SPEC_MonolithAnimation.md` § Chooser Namespace). The bulk_fill `animation` adapter still does NOT carry a chooser-table `fill_kind` — that remains `(WISHLIST)`.
 - **`v1 NotifyApplyTemplate fill_kind is audit-only.** Cited from the design spec. The handler scans the folder + glob and returns matched sequences with their existing notify / curve state, plus the template that would be applied. No writes commit. Real per-asset notify writes still flow through the existing `add_notify` / `add_curve` / `set_notify_time` actions.
 - **Skeleton compatibility surface in v0.14.10.** Schema surfaces `CompatibleSkeletons` via the existing `get_compatible_skeletons` action — bulk_fill of compatible-skeleton lists is a separate `(WISHLIST v1.1)` fill_kind.
 
@@ -221,5 +233,19 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 - `set_blend_space_axis` / `set_section_next` / `add_montage_section` dry-run integration — `(WISHLIST v1.1)` — dry_run integration on existing actions.
 - CHT_ chooser-table population fill_kind — `(WISHLIST)` — entire chooser-table action surface absent from animation_query.
 - CSV ingest of PoseSearch entries via folder + naming convention — `(WISHLIST v1.1)` per Q2.
+
+---
+
+## Chooser Namespace (5 — namespace: "chooser")
+
+A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All five actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
+
+| Action | Description |
+|--------|-------------|
+| `inspect_chooser` | Read-only inspection of a `UChooserTable`: result type and result class, ContextData parameters (class/struct requirements), row count, column count + types, referenced assets, and compile/validation status. **`referenced_assets` walks only direct `FAssetChooser` / `FSoftAssetChooser` result rows** — `NestedChooser` and `FObjectChooser` result rows return empty by design (the reference lives behind an indirection the walk does not follow). |
+| `duplicate_chooser_tree` | Duplicate one or more chooser tables into a destination folder; sources are never mutated. Optional `remap_rules` (map of old-asset-path → new-asset-path) rewrites `RootChooser` / `ParentTable` / `NestedChoosers` and result `FInstancedStruct` asset references in each duplicate. |
+| `set_context_object_class` | Rewrite the `Class` on a ContextData parameter entry (`FContextObjectTypeClass`), e.g. to retarget a chooser at a new ABP class. Marks the package dirty and recompiles (`Compile(true)`). |
+| `set_result_asset_reference` | Rewrite the `Asset` reference on a result row (`FAssetChooser` / `FSoftAssetChooser`), e.g. a PoseSearch database. Rejects non-asset result rows (e.g. `NestedChooser`) with a precise error. Marks the package dirty and recompiles (`Compile(true)`). |
+| `validate_chooser` | `Compile(true)` plus validation: optional `expected_context_class` and `expected_result_type` (`ObjectResult` / `ClassResult` / `NoPrimaryResult`), plus a sweep for null / stale result-row asset references. Read-only apart from the compile pass. |
 
 ---
