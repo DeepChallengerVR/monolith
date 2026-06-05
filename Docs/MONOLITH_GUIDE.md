@@ -75,6 +75,14 @@ Prefer the inspect actions over capture when downstream logic needs to branch on
 2. `niagara.set_emitter_loop_profile` — same action as the stateful path; pass `loop_duration_mode` (`"Fixed"` / `"Infinite"`) to set the stateless-only knob. Stateful systems emit a warning if `loop_duration_mode` is supplied because the stateful `EmitterState` module has no equivalent input.
 3. **Verify:** `niagara_query("get_emitter_timing_summary", {asset_path: "/Game/.../SLE_Foo"})` returns `stateless: true` and the topology you set.
 
+**Recipe 9 — Authoring custom (GAS-free) primary data assets.** When your project defines its own native `UPrimaryDataAsset` (or any non-Actor, non-Blueprint `UObject`) subclass, you do **not** need the `gas` namespace or any GAS plugin — `blueprint.seed_data_asset` creates the asset and reflection-populates its `UPROPERTY` fields from a JSON tree, with dry-run validation. It accepts any concrete class that is not abstract, deprecated, Actor-derived, or a Blueprint class, so a native `UPrimaryDataAsset` subclass passes the class guard with zero GAS coupling.
+1. **Dry-run first** — validate the tree against the class CDO without writing anything:
+   `blueprint seed_data_asset { save_path: "/Game/Data/DA_Foo", class_name: "YourDataAssetClass", tree: { ... }, dry_run: true }`
+   The response reports each would-be field write (`field_writes[]`) and `would_apply`. Fix any rejected paths before committing.
+2. **Commit** — re-issue with `dry_run: false` to create and save the asset.
+3. **Object-reference fields and arrays are supported.** A hard object-ref field (`TObjectPtr<USomeClass>`) takes an asset-path **string** (resolved via `StaticLoadObject`); an array of refs (`TArray<TObjectPtr<USomeClass>>`) takes a JSON **array of asset-path strings** — the reflection walker dispatches each element through the same object-ref resolver. Soft refs (`TSoftObjectPtr<...>`) take their path string too. Example tree fragment: `{ "Icon": "/Game/UI/T_Icon", "RelatedItems": ["/Game/Data/DA_Bar", "/Game/Data/DA_Baz"] }`.
+4. **Read the field shape first** if unsure — `class_name` resolution tries the name as-is, then with a `U`/`A` prefix; pass a full `/Script/Module.ClassName` path to disambiguate. Use `blueprint_query("get_cdo_properties", ...)` to inspect the writable fields before building the tree.
+
 ## decisions
 
 When two tools overlap, pick by intent:
