@@ -14,7 +14,7 @@
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 130 animation actions across `MonolithAnimationActions.cpp` (103), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`) |
+| `FMonolithAnimationModule` | Registers 133 animation actions across `MonolithAnimationActions.cpp` (103 + the 2 Wave 16 state-machine authoring actions `create_state_machine` / `build_state_machine`), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), `MonolithAnimationRuntimeActions.cpp` (1 — `sample_pie_anim_instance`), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`). The `WITH_CHOOSER`-gated `chooser` namespace (6 actions) is registered from this module but counted under its own namespace |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups (the original action handlers) |
 | `FMonolithAbpWriteActions` | ABP graph write actions (Phase v0.14.3 PR #34): `add_anim_graph_node` (built-in aliases plus generic `UAnimGraphNode_Base` class path/name resolution, with TwoBoneIK / ModifyBone helpers and auto-pin exposure), `connect_anim_graph_pins`, `set_state_animation`, `add_variable_get`, `set_anim_graph_node_property` |
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
@@ -249,16 +249,17 @@ Node-level write operations over Animation Blueprint graphs, built for reparenti
 
 ---
 
-## Chooser Namespace (5 — namespace: "chooser")
+## Chooser Namespace (6 — namespace: "chooser")
 
-A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All five actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
+A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All six actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
 
 | Action | Description |
 |--------|-------------|
 | `inspect_chooser` | Read-only inspection of a `UChooserTable`: result type and result class, ContextData parameters (class/struct requirements), row count, column count + types, referenced assets, and compile/validation status. **`referenced_assets` walks only direct `FAssetChooser` / `FSoftAssetChooser` result rows** — `NestedChooser` and `FObjectChooser` result rows return empty by design (the reference lives behind an indirection the walk does not follow). |
-| `duplicate_chooser_tree` | Duplicate one or more chooser tables into a destination folder; sources are never mutated. Optional `remap_rules` (map of old-asset-path → new-asset-path) rewrites `RootChooser` / `ParentTable` / `NestedChoosers` and result `FInstancedStruct` asset references in each duplicate. |
+| `duplicate_chooser_tree` | Duplicate one or more chooser tables into a destination folder; sources are never mutated. Params: `source_assets[]` (required), `destination_folder` (required), optional `remap_rules` (map of old-asset-path → new-asset-path). When `remap_rules` is supplied the action runs a **two-pass duplicate-then-remap** (all duplicates are created first, then references are rewritten — making the result order-independent of how nested tables reference each other) and rewrites `RootChooser` / `ParentTable` / `NestedChoosers` plus result `FInstancedStruct` asset references in each duplicate. The remap now also recurses through **nested `FEvaluateChooser` + `FNestedChooser` references** — `ResultsStructs` / `FallbackResult` / `FOutputObjectColumn`, recursing into `NestedObjects` — using normalized path matching so trailing-slash / case / `.uasset` variants resolve. Each duplicate reports a per-row `row_remap_report` of what was rewritten, and all duplicates are saved to disk. |
 | `set_context_object_class` | Rewrite the `Class` on a ContextData parameter entry (`FContextObjectTypeClass`), e.g. to retarget a chooser at a new ABP class. Marks the package dirty and recompiles (`Compile(true)`). |
-| `set_result_asset_reference` | Rewrite the `Asset` reference on a result row (`FAssetChooser` / `FSoftAssetChooser`), e.g. a PoseSearch database. Rejects non-asset result rows (e.g. `NestedChooser`) with a precise error. Marks the package dirty and recompiles (`Compile(true)`). |
+| `set_result_asset_reference` | Rewrite the `Asset` reference on a result row (`FAssetChooser` / `FSoftAssetChooser`), e.g. a PoseSearch database. Rejects non-asset result rows (e.g. `NestedChooser` / EvaluateChooser) with a precise error — use `set_evaluate_chooser_result_reference` for those. Marks the package dirty and recompiles (`Compile(true)`). |
+| `set_evaluate_chooser_result_reference` | Rewrite the child `UChooserTable` that an EvaluateChooser result row points at (`FEvaluateChooser`). Root / nested chooser rows are EvaluateChooser rows and are NOT settable via `set_result_asset_reference`; this action handles them. Params: `asset_path` (required, the table to edit), `row` (required, 0-based result row index of the EvaluateChooser row), `child_chooser_path` (required, the `UChooserTable` to point it at). Marks the package dirty and recompiles (`Compile(true)`). |
 | `validate_chooser` | `Compile(true)` plus validation: optional `expected_context_class` and `expected_result_type` (`ObjectResult` / `ClassResult` / `NoPrimaryResult`), plus a sweep for null / stale result-row asset references. Read-only apart from the compile pass. |
 
 ---
