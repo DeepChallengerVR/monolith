@@ -64,6 +64,10 @@ public:
 	// --- Capture actions ---
 	static FMonolithActionResult HandleCaptureScenePreview(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCaptureSequenceFrames(const TSharedPtr<FJsonObject>& Params);
+	// #15 preview + capture a skeletal animation asset (AnimSequence / BlendSpace /
+	// AnimBlueprint) to PNG frames at requested time samples. Reuses the same
+	// FAdvancedPreviewScene -> USceneCaptureComponent2D -> RenderAndSaveCapture path.
+	static FMonolithActionResult HandleCaptureAnimFrames(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCaptureSystemGif(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleImportTexture(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetViewportInfo(const TSharedPtr<FJsonObject>& Params);
@@ -175,5 +179,8 @@ private:
 	static bool StopPieInternal();
 
 	// Find the active PIE world context's UWorld, or nullptr when no PIE is running.
+	// Public: the anonymous-namespace map-load guard (EnsureNoResidentPieWorldBeforeMapLoad)
+	// and lifecycle reporting read this read-only PIE-residency probe from free-function scope.
+public:
 	static class UWorld* FindActivePieWorld();
 };

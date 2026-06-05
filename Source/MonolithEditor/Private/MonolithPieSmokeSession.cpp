@@ -18,6 +18,9 @@
 #include "Misc/DateTime.h"
 #include "UObject/UnrealType.h"
 
+#include "IPythonScriptPlugin.h" // #4 delayed in-session python probes
+#include "PythonScriptTypes.h"   // FPythonCommandEx
+
 DEFINE_LOG_CATEGORY_STATIC(LogMonolithPieSmoke, Log, All);
 
 namespace
@@ -155,26 +158,67 @@ namespace
 		return false;
 	}
 
-	// Read the active PIE viewport into a PNG. Returns false (no crash) when the
-	// viewport / pixels are unavailable.
-	bool CapturePieFrame(const FString& OutputPath)
+	// #7 outcome of one viewport capture attempt: whether bytes were written, and a
+	// validity verdict derived from the pixel buffer (uniform/all-black => unrendered).
+	struct FCaptureResult
 	{
+		bool bSaved = false;     // PNG written to disk
+		bool bUniform = false;   // every pixel is the same colour (incl. all-black)
+		bool bValid = false;     // bSaved && !bUniform — looks like a real render
+	};
+
+	// #7 scan a captured pixel buffer for the unrendered signature. GetPIEViewport
+	// resolves to the active level viewport; with a hidden editor / no active level
+	// viewport it is never rendered into, so ReadPixels returns uninitialised (usually
+	// all-black, sometimes a single clear colour) pixels. A frame where every pixel
+	// shares one RGB value is flagged uniform => invalid. Sampled (stride) for speed.
+	bool PixelsAreUniform(const TArray<FColor>& Pixels)
+	{
+		if (Pixels.Num() == 0)
+		{
+			return true; // no pixels => certainly not a real render
+		}
+		const FColor First = Pixels[0];
+		const int32 Stride = FMath::Max(1, Pixels.Num() / 4096); // sample up to ~4k pixels
+		for (int32 i = 0; i < Pixels.Num(); i += Stride)
+		{
+			const FColor& Px = Pixels[i];
+			if (Px.R != First.R || Px.G != First.G || Px.B != First.B)
+			{
+				return false; // colour variation => a real render
+			}
+		}
+		return true;
+	}
+
+	// Read the active PIE viewport into a PNG. Returns an FCaptureResult (no crash) —
+	// bSaved is false when the viewport / pixels are unavailable. #7 also reports whether
+	// the captured frame is uniform (all-black / single colour => unrendered).
+	FCaptureResult CapturePieFrame(const FString& OutputPath)
+	{
+		FCaptureResult Out;
+
 		FViewport* Viewport = GEditor ? GEditor->GetPIEViewport() : nullptr;
 		if (!Viewport)
 		{
-			return false;
+			return Out;
 		}
 		const FIntPoint Size = Viewport->GetSizeXY();
 		if (Size.X <= 0 || Size.Y <= 0)
 		{
-			return false;
+			return Out;
 		}
 
 		TArray<FColor> Pixels;
 		if (!Viewport->ReadPixels(Pixels) || Pixels.Num() < Size.X * Size.Y)
 		{
-			return false;
+			return Out;
 		}
+
+		// #7 validity verdict computed BEFORE the alpha overwrite (alpha is forced opaque
+		// for the PNG below, which would otherwise mask a genuinely-uniform buffer).
+		Out.bUniform = PixelsAreUniform(Pixels);
+
 		for (FColor& Px : Pixels)
 		{
 			Px.A = 255; // viewport reads can carry scene-depth alpha noise
@@ -186,7 +230,135 @@ namespace
 		FImage Image;
 		Image.Init(Size.X, Size.Y, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 		FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Size.X * Size.Y * sizeof(FColor));
-		return FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+		Out.bSaved = FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+		Out.bValid = Out.bSaved && !Out.bUniform;
+		return Out;
+	}
+
+	// #8 run a python/console script payload against the LIVE PIE world. Shared core of
+	// both FireProbe (#4) and FireStage (#8) — same call shapes used everywhere
+	// (PC->ConsoleCommand for console, IPythonScriptPlugin::ExecPythonCommandEx for python).
+	void RunScriptPayload(const FString& Python, const TArray<FString>& Console,
+		UWorld* PieWorld, bool& OutPythonOk, FString& OutPythonOutput)
+	{
+		if (Console.Num() > 0 && PieWorld)
+		{
+			APlayerController* PC = PieWorld->GetFirstPlayerController();
+			for (const FString& Command : Console)
+			{
+				if (Command.IsEmpty()) { continue; }
+				if (PC) { PC->ConsoleCommand(Command, /*bWriteToLog=*/true); }
+				else if (GEngine) { GEngine->Exec(PieWorld, *Command); }
+			}
+		}
+
+		if (!Python.IsEmpty())
+		{
+			if (IPythonScriptPlugin* PythonPlugin = IPythonScriptPlugin::Get())
+			{
+				if (PythonPlugin->IsPythonAvailable())
+				{
+					FPythonCommandEx Cmd;
+					Cmd.Command = Python;
+					Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+					OutPythonOk = PythonPlugin->ExecPythonCommandEx(Cmd);
+					OutPythonOutput = Cmd.CommandResult;
+				}
+				else
+				{
+					OutPythonOutput = TEXT("Python not available in this build.");
+				}
+			}
+			else
+			{
+				OutPythonOutput = TEXT("IPythonScriptPlugin unavailable.");
+			}
+		}
+	}
+
+	// #8 fire one staged hook exactly once and stamp its outcome.
+	void FireStage(FPieSmokeStage& Stage, UWorld* PieWorld, double ElapsedSeconds)
+	{
+		Stage.bFired = true;
+		Stage.FiredAtSeconds = ElapsedSeconds;
+		RunScriptPayload(Stage.Python, Stage.Console, PieWorld, Stage.bPythonOk, Stage.PythonOutput);
+	}
+
+	// #4 fire one delayed probe against the LIVE PIE world. Uses the SAME mechanism the
+	// run_pie_smoke RunScripts start-time path uses (PC->ConsoleCommand for console,
+	// IPythonScriptPlugin::ExecPythonCommandEx for python). Records outcome on the probe.
+	void FireProbe(FPieSmokeProbe& Probe, UWorld* PieWorld, double ElapsedSeconds)
+	{
+		Probe.bFired = true;
+		Probe.FiredAtSeconds = ElapsedSeconds;
+		RunScriptPayload(Probe.Python, Probe.Console, PieWorld, Probe.bPythonOk, Probe.PythonOutput);
+	}
+
+	// #9 derive a human-readable animation-mode token from the live mode enum.
+	const TCHAR* AnimationModeToken(EAnimationMode::Type Mode)
+	{
+		switch (Mode)
+		{
+		case EAnimationMode::AnimationBlueprint:  return TEXT("anim_blueprint");
+		case EAnimationMode::AnimationSingleNode: return TEXT("single_node");
+		case EAnimationMode::AnimationCustomMode: return TEXT("custom");
+		default:                                  return TEXT("none");
+		}
+	}
+
+	// #9 capture / refresh the runtime-identity snapshot from the live pawn each sampled
+	// tick. First resolve caches actor/skel/anim-class; subsequent ticks re-check the
+	// AnimClass to flag anim_class_changed, and (when set) the expected-class assert.
+	void UpdateRuntimeIdentity(FPieSmokeRuntimeIdentity& Id, APawn* Pawn)
+	{
+		if (!Pawn)
+		{
+			return;
+		}
+		USkeletalMeshComponent* SkelComp = Pawn->FindComponentByClass<USkeletalMeshComponent>();
+		if (!SkelComp)
+		{
+			return;
+		}
+
+		const FString MeshAnimClassPath = SkelComp->GetAnimClass()
+			? SkelComp->GetAnimClass()->GetPathName() : FString();
+
+		if (!Id.bResolved)
+		{
+			Id.bResolved = true;
+			Id.ActorName = Pawn->GetName();
+			Id.ActorClass = Pawn->GetClass() ? Pawn->GetClass()->GetName() : FString();
+			Id.SkelCompName = SkelComp->GetName();
+			if (UAnimInstance* Anim = SkelComp->GetAnimInstance())
+			{
+				Id.AnimInstanceClassPath = Anim->GetClass() ? Anim->GetClass()->GetPathName() : FString();
+			}
+			Id.MeshAnimClassPath = MeshAnimClassPath;
+			Id.AnimationMode = AnimationModeToken(SkelComp->GetAnimationMode());
+		}
+		else
+		{
+			// Re-check AnimClass each tick — a class swap (e.g. linked-anim layer change)
+			// flips anim_class_changed and refreshes the reported path/mode.
+			if (!MeshAnimClassPath.Equals(Id.MeshAnimClassPath))
+			{
+				Id.bAnimClassChanged = true;
+				Id.MeshAnimClassPath = MeshAnimClassPath;
+				if (UAnimInstance* Anim = SkelComp->GetAnimInstance())
+				{
+					Id.AnimInstanceClassPath = Anim->GetClass() ? Anim->GetClass()->GetPathName() : FString();
+				}
+				Id.AnimationMode = AnimationModeToken(SkelComp->GetAnimationMode());
+			}
+		}
+
+		// #9 expected-class assert (substring match, never crashes).
+		if (!Id.ExpectedAnimClass.IsEmpty())
+		{
+			Id.bExpectedChecked = true;
+			Id.bExpectedMismatch = !Id.MeshAnimClassPath.Contains(Id.ExpectedAnimClass);
+		}
 	}
 }
 
@@ -228,6 +400,7 @@ int32 FPieSmokeSessionManager::Stop(const FString& SessionId)
 			if (S.Status == EPieSmokeStatus::Running)
 			{
 				S.Status = EPieSmokeStatus::Stopped;
+				S.bStoppedByTool = true; // #11 lifecycle => stopped-by-tool
 				S.LastObservedSeconds = FPlatformTime::Seconds();
 				++Stopped;
 			}
@@ -247,6 +420,11 @@ int32 FPieSmokeSessionManager::Stop(const FString& SessionId)
 	if (!bAnyRunning && GEditor && FindActivePieWorld())
 	{
 		GEditor->RequestEndPlayMap();
+		// #11 mark every session whose PIE we just asked to end as teardown-started.
+		for (TPair<FString, FPieSmokeSession>& Pair : Sessions)
+		{
+			Pair.Value.bTeardownStarted = true;
+		}
 	}
 	return Stopped;
 }
@@ -372,6 +550,12 @@ bool FPieSmokeSessionManager::OnFrameTick(float /*DeltaTime*/)
 		if (GEditor && FindActivePieWorld())
 		{
 			GEditor->RequestEndPlayMap();
+			// #11 mark every session as teardown-started so lifecycle reflects the
+			// requested (still-deferred) EndPlayMap.
+			for (TPair<FString, FPieSmokeSession>& Pair : Sessions)
+			{
+				Pair.Value.bTeardownStarted = true;
+			}
 		}
 		TeardownObserverIfIdle();
 		return false; // self-unregister: no work left
@@ -397,6 +581,85 @@ void FPieSmokeSessionManager::AdvanceSession(FPieSmokeSession& Session)
 	}
 
 	const double SampleTime = FPlatformTime::Seconds() - Session.StartTimeSeconds;
+	++Session.ObserverTickCount; // #8 AfterNTicks gate
+
+	// #9 refresh the runtime-identity snapshot from the live pawn (cached first tick,
+	// re-checked each tick for anim_class_changed + the expected-class assert).
+	UpdateRuntimeIdentity(Session.Identity, Pawn);
+
+	// #7 view-target wiring, applied once on the first ready tick:
+	//   (a) always record the ACTIVE view target so a black frame can be diagnosed;
+	//   (b) when view_target_actor was requested, resolve that PIE actor and SetViewTarget
+	//       on it so the captured frames frame the intended subject.
+	if (Session.ObserverTickCount == 1)
+	{
+		if (APlayerController* PC = PieWorld->GetFirstPlayerController())
+		{
+			if (AActor* Current = PC->GetViewTarget())
+			{
+				Session.ActiveViewTargetName = Current->GetName();
+				Session.ActiveViewTargetClass = Current->GetClass() ? Current->GetClass()->GetName() : FString();
+			}
+
+			if (!Session.ViewTargetActorRequest.IsEmpty())
+			{
+				AActor* Resolved = nullptr;
+				// Match on actor name OR class-name substring (tolerant resolution).
+				for (TActorIterator<AActor> It(PieWorld); It; ++It)
+				{
+					AActor* Candidate = *It;
+					if (!Candidate) { continue; }
+					const FString Nm = Candidate->GetName();
+					const FString Cls = Candidate->GetClass() ? Candidate->GetClass()->GetName() : FString();
+					if (Nm.Contains(Session.ViewTargetActorRequest) ||
+						Cls.Contains(Session.ViewTargetActorRequest))
+					{
+						Resolved = Candidate;
+						break;
+					}
+				}
+				if (Resolved)
+				{
+					// APlayerController::SetViewTarget(AActor*, FViewTargetTransitionParams=default).
+					PC->SetViewTarget(Resolved);
+					Session.ViewTargetActorResolved = Resolved->GetName();
+					Session.ViewTargetActorClass = Resolved->GetClass() ? Resolved->GetClass()->GetName() : FString();
+					// Refresh the active view target now that we've retargeted.
+					Session.ActiveViewTargetName = Session.ViewTargetActorResolved;
+					Session.ActiveViewTargetClass = Session.ViewTargetActorClass;
+				}
+			}
+		}
+	}
+
+	// #8 staged hooks fired from the observer (PrePie is handled synchronously by the
+	// handler before PIE start). Each fires at most once at its lifecycle moment.
+	if (Session.Stages.bAny)
+	{
+		// on_begin_play: first observer tick (the observer only reaches AdvanceSession
+		// once HasBegunPlay is true, so this tick already satisfies "begin play").
+		if (!Session.Stages.OnBeginPlay.bFired &&
+			(!Session.Stages.OnBeginPlay.Python.IsEmpty() || Session.Stages.OnBeginPlay.Console.Num() > 0))
+		{
+			FireStage(Session.Stages.OnBeginPlay, PieWorld, SampleTime);
+		}
+		// after_n_ticks: fire once observer ticks reach the requested count.
+		if (!Session.Stages.AfterNTicks.bFired &&
+			(!Session.Stages.AfterNTicks.Python.IsEmpty() || Session.Stages.AfterNTicks.Console.Num() > 0) &&
+			Session.ObserverTickCount >= Session.Stages.AfterNTicks.FireAfterTicks)
+		{
+			FireStage(Session.Stages.AfterNTicks, PieWorld, SampleTime);
+		}
+	}
+
+	// #4 fire any due delayed probes against the LIVE PIE world (each fires once).
+	for (FPieSmokeProbe& Probe : Session.Probes)
+	{
+		if (!Probe.bFired && SampleTime >= Probe.AtSeconds)
+		{
+			FireProbe(Probe, PieWorld, SampleTime);
+		}
+	}
 
 	FPieSmokeSample Sample;
 	Sample.TimeSeconds = SampleTime;
@@ -426,11 +689,23 @@ void FPieSmokeSessionManager::AdvanceSession(FPieSmokeSession& Session)
 			(SampleTime - Session.LastCaptureSeconds >= Session.CaptureInterval);
 		if (bDue)
 		{
+			// #8 before_capture stage fires once, immediately before the first frame grab.
+			if (Session.Stages.bAny && !Session.Stages.BeforeCapture.bFired &&
+				(!Session.Stages.BeforeCapture.Python.IsEmpty() || Session.Stages.BeforeCapture.Console.Num() > 0))
+			{
+				FireStage(Session.Stages.BeforeCapture, PieWorld, SampleTime);
+			}
+
 			const FString FramePath = Session.OutputDir /
 				FString::Printf(TEXT("frame_%03d.png"), Session.CaptureFrameIndex);
-			if (CapturePieFrame(FramePath))
+			const FCaptureResult Cap = CapturePieFrame(FramePath);
+			if (Cap.bSaved)
 			{
 				Sample.FramePath = FramePath;
+				// #7 per-frame validity verdict (uniform / all-black => unrendered).
+				Sample.bFrameUniform = Cap.bUniform;
+				Sample.bFrameValid = Cap.bValid;
+				if (Cap.bValid) { ++Session.ValidFrames; } else { ++Session.InvalidFrames; }
 				Session.LastCaptureSeconds = SampleTime;
 				++Session.CaptureFrameIndex;
 			}
