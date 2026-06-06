@@ -7,6 +7,9 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
+#include "GameFramework/Actor.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "UObject/Class.h"
 #include "UObject/UObjectIterator.h"
@@ -77,7 +80,7 @@ void FMonolithBlueprintActions::RegisterActions()
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_component_details"),
-		TEXT("Get full property dump for a specific component in a Blueprint"),
+		TEXT("Get full property dump for a specific component in a Blueprint. Resolves both Blueprint-added (SCS) components and inherited native components declared in the C++ parent class (is_inherited_native flags which). For skeletal-mesh components also surfaces skeletal_mesh, anim_class, and animation_mode defaults explicitly."),
 		FMonolithActionHandler::CreateStatic(&HandleGetComponentDetails),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
@@ -166,7 +169,7 @@ void FMonolithBlueprintActions::RegisterActions()
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_blueprint_info"),
-		TEXT("Comprehensive Blueprint overview in one call: parent class, graph names, tick/construction script presence, variable/function/component/interface counts, and compile status."),
+		TEXT("Comprehensive Blueprint overview in one call: parent class, graph names, tick/construction script presence, variable/function/component/interface counts, and compile status. component_count is SCS-added components only; native_component_count reports inherited native components from the C++ parent class separately."),
 		FMonolithActionHandler::CreateStatic(&HandleGetBlueprintInfo),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
@@ -807,28 +810,55 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetComponentDetails(const
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: component_name"));
 	}
 
+	// Resolve the component template. BP-added components live on the
+	// SimpleConstructionScript as USCS_Node. Inherited native components
+	// (declared in a C++ parent class — e.g. CharacterMesh0 / Mesh / a custom
+	// SkeletalMeshComponent) do NOT appear in the SCS; they live as default
+	// subobjects on the parent-class CDO. We resolve those via the same
+	// parent-CDO GetComponents() walk used by get_components.
+	UActorComponent* Template = nullptr;
+	bool bIsInheritedNative = false;
+
 	USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
-	if (!SCS)
+	if (SCS)
 	{
-		return FMonolithActionResult::Error(TEXT("Blueprint has no SimpleConstructionScript (not an Actor Blueprint?)"));
+		if (USCS_Node* Node = SCS->FindSCSNode(FName(*ComponentName)))
+		{
+			Template = Node->ComponentTemplate;
+		}
 	}
 
-	USCS_Node* Node = SCS->FindSCSNode(FName(*ComponentName));
-	if (!Node)
+	// Fallback: inherited native component off the parent-class CDO subobject.
+	if (!Template && BP->ParentClass && BP->ParentClass->IsChildOf(AActor::StaticClass()))
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Component not found: %s"), *ComponentName));
+		if (AActor* CDO = Cast<AActor>(BP->ParentClass->GetDefaultObject(false)))
+		{
+			TArray<UActorComponent*> NativeComps;
+			CDO->GetComponents(NativeComps);
+			for (UActorComponent* Comp : NativeComps)
+			{
+				if (!Comp) continue;
+				if (Comp->GetName().Equals(ComponentName, ESearchCase::IgnoreCase) ||
+				    Comp->GetFName() == FName(*ComponentName))
+				{
+					Template = Comp;
+					bIsInheritedNative = true;
+					break;
+				}
+			}
+		}
 	}
 
-	UActorComponent* Template = Node->ComponentTemplate;
 	if (!Template)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Component template is null for: %s"), *ComponentName));
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Component not found: %s"), *ComponentName));
 	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("component_name"), ComponentName);
 	Root->SetStringField(TEXT("class"), Template->GetClass()->GetName());
 	Root->SetBoolField(TEXT("is_scene_component"), Template->IsA(USceneComponent::StaticClass()));
+	Root->SetBoolField(TEXT("is_inherited_native"), bIsInheritedNative);
 
 	// For USceneComponent, include transform explicitly
 	if (USceneComponent* SceneTemplate = Cast<USceneComponent>(Template))
@@ -857,6 +887,42 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetComponentDetails(const
 		TransformObj->SetObjectField(TEXT("relative_scale"), ScaleObj);
 
 		Root->SetObjectField(TEXT("transform"), TransformObj);
+	}
+
+	// Skeletal-mesh-specific defaults surfaced explicitly (over and above the
+	// generic reflected-property dump below) so callers can read mesh/anim
+	// wiring without parsing the flat property list. Uses the canonical getters
+	// verified against UE 5.7: GetSkeletalMeshAsset() -> USkeletalMesh*,
+	// GetAnimationMode() -> EAnimationMode::Type, AnimClass (UClass*).
+	if (USkeletalMeshComponent* SkelTemplate = Cast<USkeletalMeshComponent>(Template))
+	{
+		if (USkeletalMesh* Mesh = SkelTemplate->GetSkeletalMeshAsset())
+		{
+			Root->SetStringField(TEXT("skeletal_mesh"), Mesh->GetPathName());
+		}
+		else
+		{
+			Root->SetField(TEXT("skeletal_mesh"), MakeShared<FJsonValueNull>());
+		}
+
+		if (SkelTemplate->AnimClass)
+		{
+			Root->SetStringField(TEXT("anim_class"), SkelTemplate->AnimClass->GetPathName());
+		}
+		else
+		{
+			Root->SetField(TEXT("anim_class"), MakeShared<FJsonValueNull>());
+		}
+
+		FString AnimModeStr;
+		switch (SkelTemplate->GetAnimationMode())
+		{
+		case EAnimationMode::AnimationBlueprint:  AnimModeStr = TEXT("AnimationBlueprint"); break;
+		case EAnimationMode::AnimationSingleNode: AnimModeStr = TEXT("AnimationSingleNode"); break;
+		case EAnimationMode::AnimationCustomMode: AnimModeStr = TEXT("AnimationCustomMode"); break;
+		default:                                  AnimModeStr = TEXT("Unknown"); break;
+		}
+		Root->SetStringField(TEXT("animation_mode"), AnimModeStr);
 	}
 
 	// Iterate properties via reflection — include CPF_Edit or CPF_BlueprintVisible
@@ -2059,6 +2125,23 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetBlueprintInfo(const TS
 		}
 	}
 	Root->SetNumberField(TEXT("component_count"), ComponentCount);
+
+	// native_component_count — inherited native components declared in the C++
+	// parent class. These never appear in the SCS, so component_count (SCS-only,
+	// semantics preserved) reports 0 for a data-only child of a native Actor.
+	// Surface them separately rather than folding into component_count so the
+	// breakdown is explicit and the existing field stays back-compatible.
+	int32 NativeComponentCount = 0;
+	if (BP->ParentClass && BP->ParentClass->IsChildOf(AActor::StaticClass()))
+	{
+		if (AActor* ParentCDO = Cast<AActor>(BP->ParentClass->GetDefaultObject(false)))
+		{
+			TArray<UActorComponent*> NativeComps;
+			ParentCDO->GetComponents(NativeComps);
+			NativeComponentCount = NativeComps.Num();
+		}
+	}
+	Root->SetNumberField(TEXT("native_component_count"), NativeComponentCount);
 
 	// Generated class
 	if (BP->GeneratedClass)
