@@ -116,6 +116,54 @@ struct FPieSmokeProbe
 	FString PythonOutput; // CommandResult / exception trace, when available
 };
 
+// Phase 8 (OG-E2/E5): one entry of the declarative `actor_setup` block. Generic
+// spawn-and-configure spec executed ONCE against the LIVE PIE world on the first
+// ready observer tick. Fully general-purpose: ClassPath is any BP/native actor
+// class, ApplyDataAssetPath is any UObject DataAsset whose reflected fields are
+// copied onto matching-named actor properties.
+struct FPieSmokeActorSetupEntry
+{
+	FString ClassPath;                 // BP (/Game/.../BP_Foo[.BP_Foo_C]) or native class path
+	int32 Count = 1;                   // number of actors to spawn (clamped >= 1)
+	TArray<FVector> Locations;         // per-actor spawn locations; index i falls back to origin
+	FString ApplyDataAssetPath;        // optional DataAsset whose fields are copied onto each actor
+	bool bHasMoveTo = false;           // true when MoveTo was supplied
+	FVector MoveTo = FVector::ZeroVector; // AAIController::MoveToLocation destination
+};
+
+// Phase 8: per-actor outcome of one spawned actor inside an actor_setup entry. Captured
+// at execution time so poll/stop can return a STRUCTURED report (callers distinguish a
+// partial apply from a full one programmatically — not via a log line).
+struct FPieSmokeSpawnedActorResult
+{
+	bool bSpawned = false;
+	FString ActorName;
+	FString RuntimeClassPath;          // resolved spawned class path (BP_Foo_C etc.)
+	FString SpawnError;                // populated when bSpawned == false
+
+	// DataAsset field -> actor property apply outcome (the mapping is NOT 1:1).
+	TArray<FString> AppliedFields;     // fields copied onto a matching actor prop
+	TArray<FString> UnmatchedFields;   // DA fields the actor did not declare (name+type)
+
+	// AI move outcome (only meaningful when the entry requested move_to).
+	bool bMoveRequested = false;
+	bool bMoveIssued = false;          // a controller was found and MoveToLocation was called
+	FString MoveResult;               // request-result token, or why no move was issued
+};
+
+// Phase 8: result of executing one actor_setup entry (spawned actors + class resolution).
+struct FPieSmokeActorSetupResult
+{
+	FString ClassPath;                 // echoed request class
+	bool bClassResolved = false;       // the class path loaded to a UClass
+	FString ApplyDataAssetPath;        // echoed request DataAsset (empty when none)
+	bool bDataAssetLoaded = false;     // the DataAsset path loaded (only when requested)
+	FString DataAssetError;            // why the DataAsset failed to load (when requested + failed)
+	int32 RequestedCount = 0;
+	int32 SpawnedCount = 0;
+	TArray<FPieSmokeSpawnedActorResult> Actors;
+};
+
 // A single async PIE-smoke session. Advanced exclusively by the frame observer
 // (FTSTicker callback) running inside the editor's REAL frame — never by an MCP
 // handler. All access is game-thread-only, so no locking is required.
@@ -147,6 +195,13 @@ struct FPieSmokeSession
 	// #4 delayed in-session probes, fired by the per-frame observer.
 	TArray<FPieSmokeProbe> Probes;
 
+	// Phase 8 (OG-E2/E5): declarative actor_setup spec. Executed ONCE on the first ready
+	// observer tick (after BeginPlay) against the LIVE PIE world; results captured in
+	// ActorSetupResults for the poll/stop report. bActorSetupFired guards single-fire.
+	TArray<FPieSmokeActorSetupEntry> ActorSetups;
+	TArray<FPieSmokeActorSetupResult> ActorSetupResults;
+	bool bActorSetupFired = false;
+
 	// #11 explicit lifecycle string, derived at report time from (Status, bPieActive,
 	// resident PIE world). One of: running | capture-complete-pie-open |
 	// teardown-started | teardown-complete | stopped-by-tool.
@@ -172,6 +227,12 @@ struct FPieSmokeSession
 	int32 CaptureFrameIndex = 0;
 	bool bCaptureDeferred = false;    // set if viewport capture is unavailable in this build path
 
+	// #7 first-frame warm-up policy. The first DiscardFirstFrames captured frames are saved to
+	// disk (so the clip is complete) but are NOT counted toward ValidFrames / InvalidFrames —
+	// the very first ReadPixels after PIE start can return a uniform / un-warmed buffer that
+	// would otherwise be a false invalid. Default 1; 0 disables the warm-up.
+	int32 DiscardFirstFrames = 1;
+
 	// #7 capture-validity reporting (clip variant). The view target is resolved/applied at
 	// session begin; the per-frame counts are tallied as frames are captured.
 	FString ViewTargetActorRequest;   // optional view_target_actor param (name substring)
@@ -188,6 +249,29 @@ struct FPieSmokeSession
 
 	// #9 clip runtime-identity snapshot (cached + re-checked across ticks).
 	FPieSmokeRuntimeIdentity Identity;
+
+	// Phase 9 (OG-E3): PIE-session-scoped profiling. Capture is bracketed to EXACTLY the PIE
+	// window — started on the first ready (post-BeginPlay) observer tick and stopped on EVERY
+	// session-end path (success, failure, abort) via StopSessionProfiling(). All fields are
+	// game-thread-only like the rest of the session.
+	//
+	//   bCsvProfile     : caller requested csv_profile=true.
+	//   TraceChannels   : caller-supplied trace_channels (empty => no trace requested).
+	// The bStarted/bStopped flags single-fire the begin/end so re-ticks never re-arm and the
+	// stop is idempotent (so it is safe to call from multiple end paths).
+	bool bCsvProfile = false;          // request flag
+	bool bCsvStarted = false;          // BeginCapture issued for this session
+	bool bCsvAvailable = true;         // false when CSV_PROFILER is compiled out (reported)
+	FString CsvPath;                   // resolved output .csv path (filled at stop)
+	FString CsvStatus;                 // human-readable status / "unavailable" reason
+
+	TArray<FString> TraceChannels;     // requested trace channels (empty => no trace)
+	bool bTraceStarted = false;        // FTraceAuxiliary::Start issued for this session
+	FString TracePath;                 // resolved .utrace destination path (filled at start)
+	FString TraceStatus;               // human-readable status / failure reason
+
+	bool bProfilingStarted = false;    // single-fire guard for StartSessionProfiling
+	bool bProfilingStopped = false;    // single-fire guard for StopSessionProfiling (finally)
 };
 
 // Process-lifetime registry of running/finished PIE-smoke sessions plus the single

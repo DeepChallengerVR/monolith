@@ -105,6 +105,10 @@
 #include "GameFramework/Actor.h"
 #include "UObject/UnrealType.h"
 #include "UObject/SoftObjectPath.h"
+// Phase 10 (OG-E4): map post-authoring — WorldSettings GameMode override + PlayerStart spawn.
+#include "GameFramework/WorldSettings.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerStart.h"
 
 // --- Compile state ---
 
@@ -560,6 +564,9 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("probe_scripts"), TEXT("array"), TEXT("Delayed in-session probes: [{at_seconds:number, python?:string, console?:[string]}]. Each fires ONCE against the LIVE PIE world from the frame observer when session elapsed reaches at_seconds (avoids the start-time teardown race). Results reported under 'probes'."))
 			.Optional(TEXT("stages"), TEXT("object"), TEXT("Staged startup hooks fired at lifecycle moments: {pre_pie:{python?,console?:[...]} (runs synchronously BEFORE PIE start, against the editor), on_begin_play:{...} (first observer tick after HasBegunPlay), after_n_ticks:{n:int, python?,console?:[...]} (after N observer ticks), before_capture:{...} (clip variant: before first frame grab)}. Complements python_script (start-time, kept for back-compat). Results reported under 'stages'."))
 			.Optional(TEXT("on_compile_errors"), TEXT("string"), TEXT("Policy when loaded Blueprints have unresolved compile errors: \"refuse\" (default, safe) returns an error + the offending {name,path} list and does NOT start PIE; \"suppress\" starts PIE anyway and silences the engine's blocking compile-error modal (which would otherwise freeze the editor + MCP server)."), TEXT("refuse"))
+			.Optional(TEXT("actor_setup"), TEXT("array"), TEXT("Declarative spawn/apply/move block executed ONCE against the live PIE world on the first ready tick (after BeginPlay). [{class:\"/Game/.../BP_Foo\" (BP or native class path; _C suffix optional), count:<int, default 1>, locations:[[x,y,z],...] (per-actor spawn; index falls back to origin), apply_data_asset:\"/Game/.../DA_Bar\" (optional — copies the DataAsset's reflected fields onto matching-named actor properties of a COMPATIBLE type; the field->prop map is NOT 1:1), move_to:[x,y,z] (optional — AAIController::MoveToLocation via the spawned pawn's controller)}]. Reported under 'actor_setup' as {class, class_resolved, requested_count, spawned_count, data_asset_loaded?, actors:[{spawned, name, runtime_class, applied:[...], unmatched:[...], move_to:{issued,result}}]} so partial-vs-full apply is programmatically distinguishable."))
+			.Optional(TEXT("csv_profile"), TEXT("bool"), TEXT("If true, start the engine CSV profiler on session start (first post-BeginPlay tick) and stop it on completion, bracketing the capture to EXACTLY the PIE window. The .csv is written to <project>/Saved/Profiling and its path is reported under 'profiling.csv_path'. Stopped on EVERY end path (success/failure/abort). Reports profiling.csv.available=false when the build config disables the CSV profiler (CSV_PROFILER off). Default false."), TEXT("false"))
+			.Optional(TEXT("trace_channels"), TEXT("array"), TEXT("Channel names (e.g. [\"cpu\",\"frame\",\"gpu\"]) for an Unreal Insights trace started on session start and stopped on completion, bracketing the capture to the PIE window. The .utrace is written to <project>/Saved/Profiling and its path is reported under 'profiling.trace_path'. Stopped on EVERY end path. Omit/empty to disable tracing. If a trace is already connected, this session does not start (or later stop) it."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("list_errored_blueprints"),
@@ -600,14 +607,18 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("teardown_allowed"), TEXT("bool"), TEXT("If true (default), teardown-bucket must_absent hits never affect ok."), TEXT("true"))
 			.Optional(TEXT("probe_scripts"), TEXT("array"), TEXT("Delayed in-session probes [{at_seconds, python?, console?:[...]}] fired once against the live PIE world (see run_pie_smoke)."))
 			.Optional(TEXT("stages"), TEXT("object"), TEXT("Staged startup hooks {pre_pie, on_begin_play, after_n_ticks:{n,...}, before_capture} (see run_pie_smoke). before_capture fires immediately before the first frame grab. Reported under 'stages'."))
-			.Optional(TEXT("view_target_actor"), TEXT("string"), TEXT("Name- or class-substring of a PIE actor to APlayerController::SetViewTarget on at session begin, so captured frames frame the intended subject. Reported (with the active view target + per-frame validity) under 'view_target' / 'capture_validity'."))
+			.Optional(TEXT("view_target_actor"), TEXT("string"), TEXT("Outliner-label-, object-name- or class-substring of a PIE actor to APlayerController::SetViewTarget on at session begin, so captured frames frame the intended subject. Label (GetActorLabel) is matched first, then object name, then class name. Reported (with the active view target + per-frame validity) under 'view_target' / 'capture_validity'."))
+			.Optional(TEXT("discard_first_frames"), TEXT("number"), TEXT("Warm-up policy: the first N captured frames are still saved to disk (the clip stays complete) but are EXCLUDED from valid/invalid frame accounting. Prevents an un-warmed/uniform first frame from false-failing captured_ok. Clamped 0-16. Default 1; 0 disables the warm-up. A render-flush is also issued before the first ReadPixels."), TEXT("1"))
 			.Optional(TEXT("expected_anim_class"), TEXT("string"), TEXT("If set, assert the live mesh AnimClass path CONTAINS this substring each sampled tick; mismatch is reported under runtime_identity.expected_mismatch (never crashes)."))
+			.Optional(TEXT("actor_setup"), TEXT("array"), TEXT("Declarative spawn/apply/move block executed ONCE against the live PIE world on the first ready tick (after BeginPlay). [{class, count, locations:[[x,y,z],...], apply_data_asset, move_to:[x,y,z]}] — see run_pie_smoke for full semantics. Reported under 'actor_setup' with per-actor applied/unmatched DataAsset fields + move-request result."))
+			.Optional(TEXT("csv_profile"), TEXT("bool"), TEXT("If true, start the engine CSV profiler on session start (first post-BeginPlay tick) and stop it on completion, bracketing the capture to EXACTLY the PIE window. The .csv is written to <project>/Saved/Profiling and its path is reported under 'profiling.csv_path'. Stopped on EVERY end path (success/failure/abort). Reports profiling.csv.available=false when the build config disables the CSV profiler (CSV_PROFILER off). Default false."), TEXT("false"))
+			.Optional(TEXT("trace_channels"), TEXT("array"), TEXT("Channel names (e.g. [\"cpu\",\"frame\",\"gpu\"]) for an Unreal Insights trace started on session start and stopped on completion, bracketing the capture to the PIE window. The .utrace is written to <project>/Saved/Profiling and its path is reported under 'profiling.trace_path'. Stopped on EVERY end path. Omit/empty to disable tracing. If a trace is already connected, this session does not start (or later stop) it."))
 			.Build());
 
 	// --- Nav harness map builder (F4: warband-harness plan 2026-06-04) ---
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("create_nav_harness_map"),
-		TEXT("Build a navigation test map from a JSON spec: blank UWorld, floor, nav bounds, camera, target points, and BP/actor instances with UPROPERTY defaults (incl. FSoftObjectPath). All spawned actors get a SetFolderPath. Rebuilds + validates nav via runtime `ai` dispatch and saves. Writes to a throwaway map path only."),
+		TEXT("Build a navigation test map from a JSON spec: blank UWorld, floor, nav bounds, camera, target points, and BP/actor instances with reflective UPROPERTY defaults (scalars, FSoftObjectPath, object/soft-object refs, CLASS/SOFTCLASS refs `_C`-normalized, and arrays of those). Optional WorldSettings GameMode override + APlayerStart spawns. All spawned actors get a SetFolderPath. Rebuilds + validates nav via runtime `ai` dispatch and saves. Writes to a throwaway map path only."),
 		FMonolithActionHandler::CreateStatic(&HandleCreateNavHarnessMap),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("path"), TEXT("Asset path for the new UWorld (e.g. /Game/Tests/Monolith/Maps/M_NavHarness)."))
@@ -617,7 +628,20 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("target_points"), TEXT("array"), TEXT("[{name:\"start\", location:[x,y,z]}, ...] spawned as ATargetPoint actors; also used as nav validation points."))
 			.Optional(TEXT("actors"), TEXT("array"), TEXT("[{class:\"/Game/.../BP_Foo.BP_Foo_C\", location:[x,y,z], rotation:[p,y,r], folder:\"Harness\", properties:{Prop:value, SoftRefProp:\"/Game/...\"}}, ...]"))
 			.Optional(TEXT("validate_pairs"), TEXT("array"), TEXT("[{from:\"start\", to:\"goal\"}, ...] target-point name pairs that must have a nav path."))
+			.Optional(TEXT("game_mode_override"), TEXT("string"), TEXT("Class path for the map's GameMode Override (AWorldSettings::DefaultGameMode). Blueprint paths are `_C` normalized automatically; native paths (/Script/...) work directly. Must resolve to an AGameModeBase subclass."))
+			.Optional(TEXT("player_starts"), TEXT("array"), TEXT("[{location:[x,y,z], rotation:[p,y,r], name:\"Start_0\"}, ...] spawned as APlayerStart actors under Harness/PlayerStarts."))
 			.Optional(TEXT("nav_timeout"), TEXT("number"), TEXT("Seconds to wait for nav generation (passed to ai.rebuild_navigation). Default 30."), TEXT("30"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("author_map_settings"),
+		TEXT("Author map-level settings on the currently-open (or a specified) editor map: set the WorldSettings GameMode Override (AWorldSettings::DefaultGameMode), spawn APlayerStart actors at given transforms, and optionally spawn native/Blueprint actor instances (with reflective UPROPERTY defaults — float/int/bool/string/name, FSoftObjectPath, object & soft-object refs, CLASS / SOFTCLASS refs `_C`-normalized, and arrays of those leaf types). Generic complement to create_nav_harness_map — not tied to the nav-harness path. Only dirties packages on actual change; optionally saves."),
+		FMonolithActionHandler::CreateStatic(&HandleAuthorMapSettings),
+		FParamSchemaBuilder()
+			.OptionalAssetPath(TEXT("path"), TEXT("UWorld to author. Omitted = the currently-open editor world. If provided, the map is loaded as the active editor world first."))
+			.Optional(TEXT("game_mode_override"), TEXT("string"), TEXT("Class path for the GameMode Override (AWorldSettings::DefaultGameMode). Blueprint paths are `_C` normalized; native paths (/Script/...) work directly. Must resolve to an AGameModeBase subclass."))
+			.Optional(TEXT("player_starts"), TEXT("array"), TEXT("[{location:[x,y,z], rotation:[p,y,r], name:\"Start_0\"}, ...] spawned as APlayerStart actors."))
+			.Optional(TEXT("actors"), TEXT("array"), TEXT("[{class:\"/Game/.../BP_Foo.BP_Foo_C\" or /Script/Engine.PointLight, location:[x,y,z], rotation:[p,y,r], folder:\"...\", properties:{...}}, ...] — native or Blueprint actor instances with reflective property defaults."))
+			.Optional(TEXT("save"), TEXT("bool"), TEXT("Save the authored map package after applying. Default false."), TEXT("false"))
 			.Build());
 
 	// --- Capture actions ---
@@ -4788,6 +4812,82 @@ namespace MonolithEditorPieSmoke
 		return Probes;
 	}
 
+	// Phase 8: parse a [x,y,z] JSON array value into an FVector. Returns false when the
+	// value is absent or has < 3 numeric elements.
+	static bool ParseVec3Array(const TSharedPtr<FJsonValue>& Val, FVector& OutVec)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Val.IsValid() || !Val->TryGetArray(Arr) || !Arr || Arr->Num() < 3)
+		{
+			return false;
+		}
+		OutVec = FVector((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+		return true;
+	}
+
+	// Phase 8 (OG-E2/E5): parse the optional generic `actor_setup` block:
+	//   actor_setup: [
+	//     { class:"/Game/.../BP_Foo", count:3, locations:[[x,y,z],...],
+	//       apply_data_asset:"/Game/.../DA_Bar", move_to:[x,y,z] }, ...
+	//   ]
+	// Fully general-purpose — `class` is any BP/native actor class, `apply_data_asset` is
+	// any DataAsset path. Entries without a `class` are skipped (nothing to spawn).
+	static TArray<FPieSmokeActorSetupEntry> ResolveActorSetups(const TSharedPtr<FJsonObject>& Params)
+	{
+		TArray<FPieSmokeActorSetupEntry> Setups;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("actor_setup"), Arr) || !Arr)
+		{
+			return Setups;
+		}
+		for (const TSharedPtr<FJsonValue>& Val : *Arr)
+		{
+			const TSharedPtr<FJsonObject>* Obj = nullptr;
+			if (!Val.IsValid() || !Val->TryGetObject(Obj) || !Obj || !Obj->IsValid())
+			{
+				continue;
+			}
+			FPieSmokeActorSetupEntry Entry;
+			if (!(*Obj)->TryGetStringField(TEXT("class"), Entry.ClassPath) || Entry.ClassPath.IsEmpty())
+			{
+				continue; // no class => nothing to spawn
+			}
+
+			int32 Count = 1;
+			if ((*Obj)->HasField(TEXT("count")))
+			{
+				Count = static_cast<int32>((*Obj)->GetNumberField(TEXT("count")));
+			}
+			Entry.Count = FMath::Max(1, Count);
+
+			const TArray<TSharedPtr<FJsonValue>>* LocsArr = nullptr;
+			if ((*Obj)->TryGetArrayField(TEXT("locations"), LocsArr) && LocsArr)
+			{
+				for (const TSharedPtr<FJsonValue>& LocVal : *LocsArr)
+				{
+					FVector Loc = FVector::ZeroVector;
+					if (ParseVec3Array(LocVal, Loc))
+					{
+						Entry.Locations.Add(Loc);
+					}
+				}
+			}
+
+			(*Obj)->TryGetStringField(TEXT("apply_data_asset"), Entry.ApplyDataAssetPath);
+
+			const TArray<TSharedPtr<FJsonValue>>* MoveArr = nullptr;
+			if ((*Obj)->TryGetArrayField(TEXT("move_to"), MoveArr) && MoveArr && MoveArr->Num() >= 3)
+			{
+				Entry.bHasMoveTo = true;
+				Entry.MoveTo = FVector((*MoveArr)[0]->AsNumber(),
+					(*MoveArr)[1]->AsNumber(), (*MoveArr)[2]->AsNumber());
+			}
+
+			Setups.Add(MoveTemp(Entry));
+		}
+		return Setups;
+	}
+
 	// #8 parse one stage payload object {python?, console?:[...]} into a stage. The
 	// caller supplies any extra parsing (e.g. after_n_ticks 'n'). Returns true if the
 	// stage carries a runnable payload.
@@ -4868,6 +4968,10 @@ namespace MonolithEditorPieSmoke
 		// #4 delayed probes.
 		Session.Probes = ResolveProbes(Params);
 
+		// Phase 8 (OG-E2/E5): declarative actor_setup spec, executed once on the first ready
+		// observer tick against the live PIE world (spawn / apply DataAsset / AI move).
+		Session.ActorSetups = ResolveActorSetups(Params);
+
 		// #8 staged startup hooks (pre_pie fired by the handler before PIE start; the rest
 		// fired by the observer at their lifecycle moments).
 		ResolveStages(Params, Session.Stages);
@@ -4878,6 +4982,20 @@ namespace MonolithEditorPieSmoke
 		// #7 optional view-target subject (clip variant): resolved + SetViewTarget'd on the
 		// first ready observer tick so frames render the intended actor.
 		Params->TryGetStringField(TEXT("view_target_actor"), Session.ViewTargetActorRequest);
+
+		// #7 optional first-frame warm-up (clip variant): the first N captured frames are saved
+		// but excluded from valid/invalid accounting so an un-warmed first frame can't false-fail.
+		if (Params->HasField(TEXT("discard_first_frames")))
+		{
+			Session.DiscardFirstFrames = FMath::Clamp(
+				static_cast<int32>(Params->GetNumberField(TEXT("discard_first_frames"))), 0, 16);
+		}
+
+		// Phase 9 (OG-E3): session-scoped profiling. csv_profile starts the CSV profiler and
+		// trace_channels starts an Unreal Insights trace — both bracketed to EXACTLY the PIE
+		// window (started on the first post-BeginPlay observer tick, stopped on every end path).
+		Params->TryGetBoolField(TEXT("csv_profile"), Session.bCsvProfile);
+		ReadStringArrayField(Params, TEXT("trace_channels"), Session.TraceChannels);
 	}
 
 	// #8 fire the pre_pie stage synchronously, BEFORE StartPieInternal. No PIE world yet,
@@ -5194,6 +5312,107 @@ namespace MonolithEditorPieSmoke
 				ProbeArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 			Root->SetArrayField(TEXT("probes"), ProbeArr);
+		}
+
+		// Phase 8 (OG-E2/E5): structured actor_setup outcome. Per-entry class/DataAsset
+		// resolution + per-actor spawn ok/fail, applied/unmatched DataAsset fields, and the
+		// AI move-request result — so callers distinguish partial from full apply
+		// programmatically (not via a log line).
+		if (S.ActorSetupResults.Num() > 0 || S.ActorSetups.Num() > 0)
+		{
+			auto FieldsToJson = [](const TArray<FString>& Fields) -> TArray<TSharedPtr<FJsonValue>>
+			{
+				TArray<TSharedPtr<FJsonValue>> Out;
+				for (const FString& F : Fields) { Out.Add(MakeShared<FJsonValueString>(F)); }
+				return Out;
+			};
+
+			TArray<TSharedPtr<FJsonValue>> SetupArr;
+			for (const FPieSmokeActorSetupResult& Entry : S.ActorSetupResults)
+			{
+				TSharedPtr<FJsonObject> EObj = MakeShared<FJsonObject>();
+				EObj->SetStringField(TEXT("class"), Entry.ClassPath);
+				EObj->SetBoolField(TEXT("class_resolved"), Entry.bClassResolved);
+				EObj->SetNumberField(TEXT("requested_count"), Entry.RequestedCount);
+				EObj->SetNumberField(TEXT("spawned_count"), Entry.SpawnedCount);
+				if (!Entry.ApplyDataAssetPath.IsEmpty())
+				{
+					EObj->SetStringField(TEXT("apply_data_asset"), Entry.ApplyDataAssetPath);
+					EObj->SetBoolField(TEXT("data_asset_loaded"), Entry.bDataAssetLoaded);
+					if (!Entry.DataAssetError.IsEmpty())
+					{
+						EObj->SetStringField(TEXT("data_asset_error"), Entry.DataAssetError);
+					}
+				}
+
+				TArray<TSharedPtr<FJsonValue>> ActorArr;
+				for (const FPieSmokeSpawnedActorResult& A : Entry.Actors)
+				{
+					TSharedPtr<FJsonObject> AObj = MakeShared<FJsonObject>();
+					AObj->SetBoolField(TEXT("spawned"), A.bSpawned);
+					if (A.bSpawned)
+					{
+						AObj->SetStringField(TEXT("name"), A.ActorName);
+						AObj->SetStringField(TEXT("runtime_class"), A.RuntimeClassPath);
+						// Structured apply verdict — partial-vs-full is computable by the caller.
+						AObj->SetArrayField(TEXT("applied"), FieldsToJson(A.AppliedFields));
+						AObj->SetArrayField(TEXT("unmatched"), FieldsToJson(A.UnmatchedFields));
+						if (A.bMoveRequested)
+						{
+							TSharedPtr<FJsonObject> MoveObj = MakeShared<FJsonObject>();
+							MoveObj->SetBoolField(TEXT("issued"), A.bMoveIssued);
+							MoveObj->SetStringField(TEXT("result"), A.MoveResult);
+							AObj->SetObjectField(TEXT("move_to"), MoveObj);
+						}
+					}
+					else
+					{
+						AObj->SetStringField(TEXT("error"), A.SpawnError);
+					}
+					ActorArr.Add(MakeShared<FJsonValueObject>(AObj));
+				}
+				EObj->SetArrayField(TEXT("actors"), ActorArr);
+				SetupArr.Add(MakeShared<FJsonValueObject>(EObj));
+			}
+			Root->SetArrayField(TEXT("actor_setup"), SetupArr);
+		}
+
+		// Phase 9 (OG-E3): session-scoped profiling outcome. Reported whenever profiling was
+		// requested so the caller can retrieve csv_path / trace_path and confirm the capture
+		// was stopped (started_* flip false at session end via StopSessionProfiling). When CSV
+		// is compiled out, available=false + a clear status rather than a missing field.
+		if (S.bCsvProfile || S.TraceChannels.Num() > 0)
+		{
+			TSharedPtr<FJsonObject> Prof = MakeShared<FJsonObject>();
+
+			if (S.bCsvProfile)
+			{
+				TSharedPtr<FJsonObject> Csv = MakeShared<FJsonObject>();
+				Csv->SetBoolField(TEXT("requested"), true);
+				Csv->SetBoolField(TEXT("available"), S.bCsvAvailable);
+				Csv->SetBoolField(TEXT("capturing"), S.bCsvStarted);
+				if (!S.CsvStatus.IsEmpty()) { Csv->SetStringField(TEXT("status"), S.CsvStatus); }
+				if (!S.CsvPath.IsEmpty())   { Csv->SetStringField(TEXT("csv_path"), S.CsvPath); }
+				Prof->SetObjectField(TEXT("csv"), Csv);
+				// Convenience top-level mirror of the artifact path.
+				if (!S.CsvPath.IsEmpty()) { Prof->SetStringField(TEXT("csv_path"), S.CsvPath); }
+			}
+
+			if (S.TraceChannels.Num() > 0)
+			{
+				TSharedPtr<FJsonObject> Trace = MakeShared<FJsonObject>();
+				Trace->SetBoolField(TEXT("requested"), true);
+				Trace->SetBoolField(TEXT("tracing"), S.bTraceStarted);
+				TArray<TSharedPtr<FJsonValue>> ChArr;
+				for (const FString& Ch : S.TraceChannels) { ChArr.Add(MakeShared<FJsonValueString>(Ch)); }
+				Trace->SetArrayField(TEXT("channels"), ChArr);
+				if (!S.TraceStatus.IsEmpty()) { Trace->SetStringField(TEXT("status"), S.TraceStatus); }
+				if (!S.TracePath.IsEmpty())   { Trace->SetStringField(TEXT("trace_path"), S.TracePath); }
+				Prof->SetObjectField(TEXT("trace"), Trace);
+				if (!S.TracePath.IsEmpty()) { Prof->SetStringField(TEXT("trace_path"), S.TracePath); }
+			}
+
+			Root->SetObjectField(TEXT("profiling"), Prof);
 		}
 
 		return Root;
@@ -5517,8 +5736,155 @@ namespace MonolithEditorNavHarness
 		return Arr;
 	}
 
+	// Resolve a JSON class-path string to a UClass*, tolerating both the Blueprint
+	// object path ("/Game/.../BP_Foo.BP_Foo") and the generated-class form
+	// ("/Game/.../BP_Foo.BP_Foo_C"). A bare object path imported into a CLASS/SOFTCLASS
+	// property would resolve to the UBlueprint object, not its generated UClass — so
+	// class-typed props MUST normalize to the `_C` generated-class form first.
+	// Native class paths ("/Script/Engine.PointLight") resolve unchanged. Returns
+	// nullptr if neither form loads.
+	static UClass* ResolveClassPath(const FString& InPath)
+	{
+		if (InPath.IsEmpty())
+		{
+			return nullptr;
+		}
+		// Direct load first — handles /Script/... native classes and already-`_C` paths.
+		if (UClass* Direct = LoadClass<UObject>(nullptr, *InPath))
+		{
+			return Direct;
+		}
+		if (UClass* DirectObj = LoadObject<UClass>(nullptr, *InPath))
+		{
+			return DirectObj;
+		}
+		// Normalize a Blueprint object path to its generated-class form: append `_C`
+		// to the asset-name component after the trailing '.'.
+		FString Normalized = InPath;
+		if (!Normalized.EndsWith(TEXT("_C")))
+		{
+			int32 DotIdx = INDEX_NONE;
+			if (Normalized.FindLastChar(TEXT('.'), DotIdx))
+			{
+				Normalized += TEXT("_C");
+			}
+			else
+			{
+				// "/Game/.../BP_Foo" with no '.' — append ".<name>_C".
+				int32 SlashIdx = INDEX_NONE;
+				if (Normalized.FindLastChar(TEXT('/'), SlashIdx))
+				{
+					const FString AssetName = Normalized.RightChop(SlashIdx + 1);
+					Normalized += FString::Printf(TEXT(".%s_C"), *AssetName);
+				}
+			}
+		}
+		if (Normalized != InPath)
+		{
+			if (UClass* Gen = LoadClass<UObject>(nullptr, *Normalized))
+			{
+				return Gen;
+			}
+			if (UClass* GenObj = LoadObject<UClass>(nullptr, *Normalized))
+			{
+				return GenObj;
+			}
+		}
+		return nullptr;
+	}
+
+	// Apply a single JSON value onto one already-addressed FProperty slot (the actor's
+	// own member, OR an array element via FScriptArrayHelper::GetRawPtr). Handles every
+	// scalar leaf type plus class/soft-class/object/soft-object refs. Returns true on a
+	// successful set; on an unsupported type, returns false and fills OutWhyUnsupported.
+	// Container types (array) are handled by the caller, not here.
+	//
+	// CLASS-property ordering note: FClassProperty derives from FObjectProperty and
+	// FSoftClassProperty derives from FSoftObjectProperty, so the class branches MUST be
+	// tested BEFORE the generic object/soft-object branch — otherwise a class path is
+	// imported as an OBJECT path (resolving to the UBlueprint, not its generated UClass).
+	static bool TryApplyLeaf(FProperty* Prop, void* ValuePtr, const TSharedPtr<FJsonValue>& Value, UObject* Owner, FString& OutWhyUnsupported)
+	{
+		if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+		{
+			FloatProp->SetPropertyValue(ValuePtr, Value->AsNumber());
+		}
+		else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+		{
+			DoubleProp->SetPropertyValue(ValuePtr, Value->AsNumber());
+		}
+		else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+		{
+			IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Value->AsNumber()));
+		}
+		else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+		{
+			BoolProp->SetPropertyValue(ValuePtr, Value->AsBool());
+		}
+		else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+		{
+			StrProp->SetPropertyValue(ValuePtr, Value->AsString());
+		}
+		else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+		{
+			NameProp->SetPropertyValue(ValuePtr, FName(*Value->AsString()));
+		}
+		else if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			// FSoftObjectPath (and any string-importable struct) goes through the
+			// reflection text importer — same pattern as MonolithMaterialActions.
+			if (StructProp->Struct == TBaseStructure<FSoftObjectPath>::Get())
+			{
+				const FString PathStr = Value->AsString();
+				Prop->ImportText_Direct(*PathStr, ValuePtr, Owner, PPF_None);
+			}
+			else
+			{
+				OutWhyUnsupported = TEXT("unsupported struct ") + StructProp->Struct->GetName();
+				return false;
+			}
+		}
+		// CLASS / SOFTCLASS refs — resolve the class path (with `_C` normalization) and
+		// store the UClass* via SetObjectPropertyValue (the authoritative engine pattern,
+		// PyConversion.cpp:838-873). MUST precede the generic object branch (see note above).
+		else if (FClassProperty* ClassProp = CastField<FClassProperty>(Prop))
+		{
+			UClass* Resolved = ResolveClassPath(Value->AsString());
+			if (!Resolved)
+			{
+				OutWhyUnsupported = TEXT("could not resolve class path '") + Value->AsString() + TEXT("'");
+				return false;
+			}
+			ClassProp->SetObjectPropertyValue(ValuePtr, Resolved);
+		}
+		else if (FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Prop))
+		{
+			UClass* Resolved = ResolveClassPath(Value->AsString());
+			if (!Resolved)
+			{
+				OutWhyUnsupported = TEXT("could not resolve class path '") + Value->AsString() + TEXT("'");
+				return false;
+			}
+			SoftClassProp->SetObjectPropertyValue(ValuePtr, Resolved);
+		}
+		else if (CastField<FSoftObjectProperty>(Prop) || CastField<FObjectProperty>(Prop))
+		{
+			// Asset reference by path string (e.g. an animation DB or mesh).
+			const FString PathStr = Value->AsString();
+			Prop->ImportText_Direct(*PathStr, ValuePtr, Owner, PPF_None);
+		}
+		else
+		{
+			OutWhyUnsupported = TEXT("unsupported type ") + Prop->GetClass()->GetName();
+			return false;
+		}
+		return true;
+	}
+
 	// Apply a JSON "properties" object onto a spawned actor reflectively. Supports
-	// float/double, int, bool, string/name, and FSoftObjectPath (string value).
+	// float/double, int, bool, string/name, FSoftObjectPath (string value), object /
+	// soft-object refs (asset path string), CLASS / SOFTCLASS refs (class path, `_C`
+	// normalized), and arrays whose inner element is any of the above leaf types.
 	// Unknown / unsupported properties are recorded in OutSkipped, never fatal.
 	static void ApplyProperties(AActor* Actor, const TSharedPtr<FJsonObject>& PropObj, TArray<FString>& OutApplied, TArray<FString>& OutSkipped)
 	{
@@ -5538,58 +5904,131 @@ namespace MonolithEditorNavHarness
 			}
 			void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Actor);
 
-			if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+			// Array of object / soft-object / class / soft-class / scalar leaf elements.
+			// Mirrors the verified FScriptArrayHelper write pattern in
+			// MonolithReflectionWalker.cpp (ctor UnrealType.h:4455, EmptyValues,
+			// AddUninitializedValues, GetRawPtr) + the object-inner set in
+			// MonolithAIStateTreeActions.cpp:2622-2627.
+			if (FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop))
 			{
-				FloatProp->SetPropertyValue(ValuePtr, Value->AsNumber());
-			}
-			else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
-			{
-				DoubleProp->SetPropertyValue(ValuePtr, Value->AsNumber());
-			}
-			else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
-			{
-				IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Value->AsNumber()));
-			}
-			else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
-			{
-				BoolProp->SetPropertyValue(ValuePtr, Value->AsBool());
-			}
-			else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
-			{
-				StrProp->SetPropertyValue(ValuePtr, Value->AsString());
-			}
-			else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
-			{
-				NameProp->SetPropertyValue(ValuePtr, FName(*Value->AsString()));
-			}
-			else if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
-			{
-				// FSoftObjectPath (and any string-importable struct) goes through the
-				// reflection text importer — same pattern as MonolithMaterialActions.
-				if (StructProp->Struct == TBaseStructure<FSoftObjectPath>::Get())
+				const TArray<TSharedPtr<FJsonValue>>* JsonArray = nullptr;
+				if (!Value->TryGetArray(JsonArray) || !JsonArray)
 				{
-					const FString PathStr = Value->AsString();
-					Prop->ImportText_Direct(*PathStr, ValuePtr, Actor, PPF_None);
-				}
-				else
-				{
-					OutSkipped.Add(PropName + TEXT(" (unsupported struct ") + StructProp->Struct->GetName() + TEXT(")"));
+					OutSkipped.Add(PropName + TEXT(" (expected JSON array)"));
 					continue;
 				}
+
+				FScriptArrayHelper Helper(ArrayProp, ValuePtr);
+				Helper.EmptyValues(JsonArray->Num());
+				if (JsonArray->Num() > 0)
+				{
+					Helper.AddUninitializedValues(JsonArray->Num());
+				}
+
+				int32 ElemErrors = 0;
+				FString FirstWhy;
+				for (int32 i = 0; i < JsonArray->Num(); ++i)
+				{
+					uint8* ElemPtr = Helper.GetRawPtr(i);
+					ArrayProp->Inner->InitializeValue(ElemPtr);
+					FString Why;
+					if (!TryApplyLeaf(ArrayProp->Inner, ElemPtr, (*JsonArray)[i], Actor, Why))
+					{
+						++ElemErrors;
+						if (FirstWhy.IsEmpty()) { FirstWhy = Why; }
+					}
+				}
+
+				if (ElemErrors > 0)
+				{
+					OutSkipped.Add(FString::Printf(TEXT("%s (%d/%d array elements failed: %s)"),
+						*PropName, ElemErrors, JsonArray->Num(), *FirstWhy));
+					continue;
+				}
+				OutApplied.Add(PropName);
+				continue;
 			}
-			else if (CastField<FSoftObjectProperty>(Prop) || CastField<FObjectProperty>(Prop))
+
+			FString Why;
+			if (!TryApplyLeaf(Prop, ValuePtr, Value, Actor, Why))
 			{
-				// Asset reference by path string (e.g. an animation DB or mesh).
-				const FString PathStr = Value->AsString();
-				Prop->ImportText_Direct(*PathStr, ValuePtr, Actor, PPF_None);
-			}
-			else
-			{
-				OutSkipped.Add(PropName + TEXT(" (unsupported type ") + Prop->GetClass()->GetName() + TEXT(")"));
+				OutSkipped.Add(PropName + TEXT(" (") + Why + TEXT(")"));
 				continue;
 			}
 			OutApplied.Add(PropName);
 		}
+	}
+
+	// Shared map-authoring helpers for both create_nav_harness_map and
+	// editor.author_map_settings. Applied to whatever editor world the caller passes —
+	// they ONLY mutate (and dirty) on an actual change.
+
+	// Set AWorldSettings::DefaultGameMode ("GameMode Override") from a class path.
+	// Idiom: Modify()-then-assign (WorldSettingsDetails.cpp:71). Returns false + reason
+	// on a resolution failure WITHOUT touching the package. CONFIRMED member type is
+	// TSubclassOf<AGameModeBase> (WorldSettings.h:599).
+	static bool ApplyGameModeOverride(UWorld* World, const FString& ClassPath, FString& OutResolved, FString& OutError)
+	{
+		AWorldSettings* WS = World ? World->GetWorldSettings() : nullptr;
+		if (!WS)
+		{
+			OutError = TEXT("no AWorldSettings on the target world");
+			return false;
+		}
+		UClass* GameModeClass = ResolveClassPath(ClassPath);
+		if (!GameModeClass || !GameModeClass->IsChildOf(AGameModeBase::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("'%s' did not resolve to an AGameModeBase subclass"), *ClassPath);
+			return false;
+		}
+		WS->Modify();
+		WS->DefaultGameMode = GameModeClass;
+		WS->MarkPackageDirty();
+		OutResolved = GameModeClass->GetPathName();
+		return true;
+	}
+
+	// Spawn APlayerStart actors at each transform in a JSON array of
+	// {location:[x,y,z], rotation:[p,y,r]} objects. Appends one report row per spawn to
+	// OutRows and returns the spawned count. Only dirties packages it actually creates.
+	static int32 SpawnPlayerStarts(UWorld* World, const TArray<TSharedPtr<FJsonValue>>& StartsArr,
+		const FActorSpawnParameters& SpawnParams, TArray<TSharedPtr<FJsonValue>>& OutRows)
+	{
+		int32 Count = 0;
+		for (const TSharedPtr<FJsonValue>& Val : StartsArr)
+		{
+			const TSharedPtr<FJsonObject> StartObj = Val.IsValid() ? Val->AsObject() : nullptr;
+			FVector Loc = FVector::ZeroVector;
+			FVector Rot = FVector::ZeroVector;
+			if (StartObj.IsValid())
+			{
+				ParseVec3(StartObj, TEXT("location"), Loc);
+				ParseVec3(StartObj, TEXT("rotation"), Rot);
+			}
+
+			APlayerStart* Start = World->SpawnActor<APlayerStart>(APlayerStart::StaticClass(), Loc,
+				FRotator(Rot.X, Rot.Y, Rot.Z), SpawnParams);
+			if (!Start)
+			{
+				continue;
+			}
+			FString Label = FString::Printf(TEXT("Harness_PlayerStart_%d"), Count);
+			if (StartObj.IsValid())
+			{
+				StartObj->TryGetStringField(TEXT("name"), Label);
+			}
+			Start->SetActorLabel(Label);
+			Start->SetFolderPath(TEXT("Harness/PlayerStarts"));
+			Start->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("kind"), TEXT("player_start"));
+			Row->SetStringField(TEXT("name"), Start->GetActorNameOrLabel());
+			Row->SetArrayField(TEXT("location"), Vec3ToJson(Loc));
+			OutRows.Add(MakeShared<FJsonValueObject>(Row));
+			++Count;
+		}
+		return Count;
 	}
 }
 
@@ -5826,6 +6265,35 @@ FMonolithActionResult FMonolithEditorActions::HandleCreateNavHarnessMap(const TS
 		}
 	}
 
+	// 5b. WorldSettings GameMode override (optional). Only dirties on a real change.
+	{
+		FString GameModePath;
+		if (Params->TryGetStringField(TEXT("game_mode_override"), GameModePath) && !GameModePath.IsEmpty())
+		{
+			FString Resolved, Error;
+			if (ApplyGameModeOverride(World, GameModePath, Resolved, Error))
+			{
+				Result->SetBoolField(TEXT("game_mode_override_set"), true);
+				Result->SetStringField(TEXT("game_mode_override"), Resolved);
+			}
+			else
+			{
+				Result->SetBoolField(TEXT("game_mode_override_set"), false);
+				Result->SetStringField(TEXT("game_mode_override_error"), Error);
+			}
+		}
+	}
+
+	// 5c. PlayerStart actors (optional).
+	{
+		const TArray<TSharedPtr<FJsonValue>>* StartsArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("player_starts"), StartsArr) && StartsArr)
+		{
+			const int32 Spawned = SpawnPlayerStarts(World, *StartsArr, SpawnParams, SpawnedActors);
+			Result->SetNumberField(TEXT("player_starts_spawned"), Spawned);
+		}
+	}
+
 	// 6. Nav bounds — default sized to the floor footprint unless overridden.
 	{
 		FVector NavLoc = FVector::ZeroVector;
@@ -5910,5 +6378,196 @@ FMonolithActionResult FMonolithEditorActions::HandleCreateNavHarnessMap(const TS
 	Result->SetStringField(TEXT("path"), MapPath);
 	Result->SetArrayField(TEXT("spawned_actors"), SpawnedActors);
 	Result->SetArrayField(TEXT("actor_instances"), ActorReports);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 (OG-E4): author_map_settings — generic map post-authoring.
+// Sets the WorldSettings GameMode override + spawns APlayerStart actors (and optional
+// generic actor instances with reflective UPROPERTY defaults) on the currently-open
+// editor world, or on a `path`-specified map loaded first. Map mutation dirties the
+// package by design; we only dirty on actual change and save only when asked.
+// ---------------------------------------------------------------------------
+FMonolithActionResult FMonolithEditorActions::HandleAuthorMapSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithEditorNavHarness;
+
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("author_map_settings requires editor context (GEditor)."));
+	}
+	if (!Params.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("author_map_settings requires a params object."));
+	}
+
+	// Resolve the target world: load `path` as the active editor world if provided,
+	// otherwise author whatever map is currently open.
+	FString MapPath;
+	const bool bHasPath = Params->TryGetStringField(TEXT("path"), MapPath) && !MapPath.IsEmpty();
+	if (bHasPath)
+	{
+		ULevelEditorSubsystem* LevelEd = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>();
+		if (!LevelEd || !LevelEd->LoadLevel(MapPath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to load '%s' as the editor world."), *MapPath));
+		}
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world to author."));
+	}
+
+	// Require at least one authoring directive so a no-op call can't silently dirty.
+	const bool bHasGameMode = Params->HasField(TEXT("game_mode_override"));
+	const bool bHasStarts = Params->HasField(TEXT("player_starts"));
+	const bool bHasActors = Params->HasField(TEXT("actors"));
+	if (!bHasGameMode && !bHasStarts && !bHasActors)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("author_map_settings requires at least one of: game_mode_override, player_starts, actors."));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> SpawnedActors;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	// 1. GameMode override.
+	if (bHasGameMode)
+	{
+		FString GameModePath;
+		Params->TryGetStringField(TEXT("game_mode_override"), GameModePath);
+		FString Resolved, Error;
+		if (!GameModePath.IsEmpty() && ApplyGameModeOverride(World, GameModePath, Resolved, Error))
+		{
+			Result->SetBoolField(TEXT("game_mode_override_set"), true);
+			Result->SetStringField(TEXT("game_mode_override"), Resolved);
+		}
+		else
+		{
+			Result->SetBoolField(TEXT("game_mode_override_set"), false);
+			Result->SetStringField(TEXT("game_mode_override_error"),
+				GameModePath.IsEmpty() ? TEXT("empty class path") : Error);
+		}
+	}
+
+	// 2. PlayerStart actors.
+	if (bHasStarts)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* StartsArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("player_starts"), StartsArr) && StartsArr)
+		{
+			const int32 Spawned = SpawnPlayerStarts(World, *StartsArr, SpawnParams, SpawnedActors);
+			Result->SetNumberField(TEXT("player_starts_spawned"), Spawned);
+		}
+	}
+
+	// 3. Generic actor instances (native or Blueprint) with reflective property defaults.
+	TArray<TSharedPtr<FJsonValue>> ActorReports;
+	if (bHasActors)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ActorsArr = nullptr;
+		if (Params->TryGetArrayField(TEXT("actors"), ActorsArr) && ActorsArr)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : *ActorsArr)
+			{
+				const TSharedPtr<FJsonObject> ActorObj = Val.IsValid() ? Val->AsObject() : nullptr;
+				if (!ActorObj.IsValid())
+				{
+					continue;
+				}
+				FString ClassPath;
+				if (!ActorObj->TryGetStringField(TEXT("class"), ClassPath) || ClassPath.IsEmpty())
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> ActorRow = MakeShared<FJsonObject>();
+				ActorRow->SetStringField(TEXT("class"), ClassPath);
+
+				UClass* ActorClass = ResolveClassPath(ClassPath);
+				if (!ActorClass || !ActorClass->IsChildOf(AActor::StaticClass()))
+				{
+					ActorRow->SetBoolField(TEXT("spawned"), false);
+					ActorRow->SetStringField(TEXT("error"), TEXT("could not resolve actor class"));
+					ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+					continue;
+				}
+
+				FVector Loc = FVector::ZeroVector;
+				FVector Rot = FVector::ZeroVector;
+				ParseVec3(ActorObj, TEXT("location"), Loc);
+				ParseVec3(ActorObj, TEXT("rotation"), Rot);
+
+				AActor* Spawned = World->SpawnActor<AActor>(ActorClass, Loc,
+					FRotator(Rot.X, Rot.Y, Rot.Z), SpawnParams);
+				if (!Spawned)
+				{
+					ActorRow->SetBoolField(TEXT("spawned"), false);
+					ActorRow->SetStringField(TEXT("error"), TEXT("SpawnActor returned null"));
+					ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+					continue;
+				}
+
+				FString Folder;
+				if (ActorObj->TryGetStringField(TEXT("folder"), Folder) && !Folder.IsEmpty())
+				{
+					Spawned->SetFolderPath(FName(*Folder));
+				}
+
+				TArray<FString> Applied, Skipped;
+				const TSharedPtr<FJsonObject>* PropObj = nullptr;
+				if (ActorObj->TryGetObjectField(TEXT("properties"), PropObj) && PropObj)
+				{
+					ApplyProperties(Spawned, *PropObj, Applied, Skipped);
+				}
+				Spawned->MarkPackageDirty();
+
+				ActorRow->SetBoolField(TEXT("spawned"), true);
+				ActorRow->SetStringField(TEXT("name"), Spawned->GetActorNameOrLabel());
+				ActorRow->SetNumberField(TEXT("properties_applied"), Applied.Num());
+				if (Skipped.Num() > 0)
+				{
+					TArray<TSharedPtr<FJsonValue>> SkippedJson;
+					for (const FString& S : Skipped) { SkippedJson.Add(MakeShared<FJsonValueString>(S)); }
+					ActorRow->SetArrayField(TEXT("properties_skipped"), SkippedJson);
+				}
+				ActorReports.Add(MakeShared<FJsonValueObject>(ActorRow));
+			}
+		}
+	}
+
+	// 4. Optional save — apply-then-save atomicity per the harness flow (save only after
+	//    all mutations land, never mid-apply).
+	bool bSave = false;
+	Params->TryGetBoolField(TEXT("save"), bSave);
+	if (bSave)
+	{
+		const FString SavePath = bHasPath ? MapPath : World->GetOutermost()->GetName();
+		TSharedPtr<FJsonObject> SaveParams = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> PkgArr;
+		PkgArr.Add(MakeShared<FJsonValueString>(SavePath));
+		SaveParams->SetArrayField(TEXT("packages"), PkgArr);
+		const FMonolithActionResult SaveRes =
+			FMonolithToolRegistry::Get().ExecuteAction(TEXT("editor"), TEXT("save_packages"), SaveParams);
+		Result->SetBoolField(TEXT("saved"), SaveRes.bSuccess);
+		if (!SaveRes.bSuccess)
+		{
+			Result->SetStringField(TEXT("save_error"), SaveRes.ErrorMessage);
+		}
+	}
+
+	Result->SetBoolField(TEXT("ok"), true);
+	Result->SetStringField(TEXT("map"), World->GetOutermost()->GetName());
+	Result->SetArrayField(TEXT("spawned_actors"), SpawnedActors);
+	if (ActorReports.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("actor_instances"), ActorReports);
+	}
 	return FMonolithActionResult::Success(Result);
 }

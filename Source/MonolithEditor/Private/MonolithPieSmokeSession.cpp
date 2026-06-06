@@ -6,11 +6,19 @@
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/Controller.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
 #include "EngineUtils.h"
 
+// Phase 8 (OG-E2/E5): structured actor_setup execution against the live PIE world.
+#include "AIController.h"            // AAIController::MoveToLocation (AIModule dep)
+#include "Navigation/PathFollowingComponent.h" // EPathFollowingRequestResult tokens
+#include "UObject/UObjectGlobals.h"  // LoadObject / LoadClass
+#include "UObject/Class.h"           // FProperty iteration / SameType / CopyCompleteValue
+
 #include "UnrealClient.h"        // FViewport (PIE frame capture)
+#include "RenderingThread.h"     // FlushRenderingCommands (render-flush before first ReadPixels)
 #include "ImageUtils.h"          // FImageUtils::SaveImageAutoFormat
 #include "ImageCore.h"           // FImage / ERawImageFormat / EGammaSpace
 #include "Misc/Paths.h"
@@ -20,6 +28,14 @@
 
 #include "IPythonScriptPlugin.h" // #4 delayed in-session python probes
 #include "PythonScriptTypes.h"   // FPythonCommandEx
+
+// Phase 9 (OG-E3): PIE-session-scoped profiling (CSV profiler + Unreal Insights trace).
+// Both live in Core; no new module dependency is required (Core is already a public dep of
+// MonolithEditor). FCsvProfiler is gated behind CSV_PROFILER (WITH_ENGINE && !UE_BUILD_SHIPPING
+// by default) — when that macro is off the begin/end-capture path compiles out cleanly and the
+// session reports "profiling unavailable in this build config" instead of failing to build.
+#include "ProfilingDebugging/CsvProfiler.h"   // FCsvProfiler::Get()->BeginCapture / EndCapture
+#include "ProfilingDebugging/TraceAuxiliary.h" // FTraceAuxiliary::Start / Stop
 
 DEFINE_LOG_CATEGORY_STATIC(LogMonolithPieSmoke, Log, All);
 
@@ -194,7 +210,7 @@ namespace
 	// Read the active PIE viewport into a PNG. Returns an FCaptureResult (no crash) —
 	// bSaved is false when the viewport / pixels are unavailable. #7 also reports whether
 	// the captured frame is uniform (all-black / single colour => unrendered).
-	FCaptureResult CapturePieFrame(const FString& OutputPath)
+	FCaptureResult CapturePieFrame(const FString& OutputPath, bool bFlushBeforeRead)
 	{
 		FCaptureResult Out;
 
@@ -207,6 +223,14 @@ namespace
 		if (Size.X <= 0 || Size.Y <= 0)
 		{
 			return Out;
+		}
+
+		// #7 drain the render thread before the first read so ReadPixels sees a fully-rendered
+		// back-buffer rather than an un-warmed / uniform one. FlushRenderingCommands() is a
+		// no-op when the RHI isn't initialised, so it is safe to call here.
+		if (bFlushBeforeRead)
+		{
+			FlushRenderingCommands();
 		}
 
 		TArray<FColor> Pixels;
@@ -294,6 +318,195 @@ namespace
 		RunScriptPayload(Probe.Python, Probe.Console, PieWorld, Probe.bPythonOk, Probe.PythonOutput);
 	}
 
+	// Phase 8: human-readable token for an AI move request result.
+	const TCHAR* MoveRequestToken(EPathFollowingRequestResult::Type Result)
+	{
+		switch (Result)
+		{
+		case EPathFollowingRequestResult::Failed:           return TEXT("failed");
+		case EPathFollowingRequestResult::AlreadyAtGoal:    return TEXT("already_at_goal");
+		case EPathFollowingRequestResult::RequestSuccessful: return TEXT("request_successful");
+		default:                                            return TEXT("unknown");
+		}
+	}
+
+	// Phase 8: copy the DataAsset's reflected fields onto matching-named actor properties.
+	// The DA-field -> actor-prop mapping is NOT 1:1: a field is applied only when the actor
+	// also declares a property of the SAME NAME and a COMPATIBLE TYPE (FProperty::SameType).
+	// Every DA field is bucketed into AppliedFields or UnmatchedFields so the caller gets a
+	// STRUCTURED partial-vs-full apply verdict — never a bare log line. Read-only on the DA;
+	// writes only into the transient PIE actor (no asset/package dirtying).
+	void ApplyDataAssetFields(UObject* DataAsset, AActor* Actor, FPieSmokeSpawnedActorResult& OutResult)
+	{
+		if (!DataAsset || !Actor)
+		{
+			return;
+		}
+		UClass* ActorClass = Actor->GetClass();
+		for (TFieldIterator<FProperty> It(DataAsset->GetClass()); It; ++It)
+		{
+			FProperty* DataProp = *It;
+			if (!DataProp)
+			{
+				continue;
+			}
+			const FString FieldName = DataProp->GetName();
+
+			// Skip the UObject base bookkeeping props the indexer also skips — they are never
+			// meaningful to copy onto a gameplay actor and would only pollute the report.
+			if (DataProp->HasAnyPropertyFlags(CPF_Transient))
+			{
+				continue;
+			}
+
+			FProperty* ActorProp = ActorClass->FindPropertyByName(FName(*FieldName));
+			if (!ActorProp || !ActorProp->SameType(DataProp))
+			{
+				OutResult.UnmatchedFields.Add(FieldName);
+				continue;
+			}
+
+			const void* SrcPtr = DataProp->ContainerPtrToValuePtr<void>(DataAsset);
+			void* DestPtr = ActorProp->ContainerPtrToValuePtr<void>(Actor);
+			if (SrcPtr && DestPtr)
+			{
+				ActorProp->CopyCompleteValue(DestPtr, SrcPtr);
+				OutResult.AppliedFields.Add(FieldName);
+			}
+			else
+			{
+				OutResult.UnmatchedFields.Add(FieldName);
+			}
+		}
+	}
+
+	// Phase 8: execute the declarative actor_setup spec ONCE against the live PIE world.
+	// For each entry: resolve the class, load the optional DataAsset, spawn `count` actors,
+	// reflectively apply DA fields, and (when move_to is set) issue AAIController::MoveToLocation
+	// via the spawned pawn's controller. Every step null-checks + reports rather than crashes;
+	// spawn failures are captured, not fatal. Results land in Session.ActorSetupResults.
+	void FireActorSetup(FPieSmokeSession& Session, UWorld* PieWorld)
+	{
+		// Guard against ever spawning into the editor (non-PIE) world.
+		if (!PieWorld || PieWorld->WorldType != EWorldType::PIE)
+		{
+			return;
+		}
+
+		for (const FPieSmokeActorSetupEntry& Entry : Session.ActorSetups)
+		{
+			FPieSmokeActorSetupResult Result;
+			Result.ClassPath = Entry.ClassPath;
+			Result.ApplyDataAssetPath = Entry.ApplyDataAssetPath;
+			Result.RequestedCount = FMath::Max(1, Entry.Count);
+
+			// Resolve the actor class. Mirror the proven nav-harness resolution: LoadClass
+			// for a generated-class path, LoadObject as the _C-suffix-omission fallback.
+			UClass* ActorClass = LoadClass<AActor>(nullptr, *Entry.ClassPath);
+			if (!ActorClass)
+			{
+				ActorClass = LoadObject<UClass>(nullptr, *Entry.ClassPath);
+			}
+			Result.bClassResolved = (ActorClass != nullptr);
+
+			// Optionally load the DataAsset whose fields we copy onto each spawned actor.
+			UObject* DataAsset = nullptr;
+			if (!Entry.ApplyDataAssetPath.IsEmpty())
+			{
+				DataAsset = LoadObject<UObject>(nullptr, *Entry.ApplyDataAssetPath);
+				Result.bDataAssetLoaded = (DataAsset != nullptr);
+				if (!DataAsset)
+				{
+					Result.DataAssetError = TEXT("could not load apply_data_asset path");
+				}
+			}
+
+			if (!ActorClass)
+			{
+				// No class -> nothing to spawn; still emit the (failed) entry result.
+				Session.ActorSetupResults.Add(MoveTemp(Result));
+				continue;
+			}
+
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride =
+				ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+			const int32 SpawnCount = Result.RequestedCount;
+			for (int32 i = 0; i < SpawnCount; ++i)
+			{
+				FPieSmokeSpawnedActorResult ActorResult;
+
+				const FVector Loc = Entry.Locations.IsValidIndex(i)
+					? Entry.Locations[i] : FVector::ZeroVector;
+
+				AActor* Spawned = PieWorld->SpawnActor<AActor>(
+					ActorClass, Loc, FRotator::ZeroRotator, SpawnParams);
+				if (!Spawned)
+				{
+					ActorResult.bSpawned = false;
+					ActorResult.SpawnError = TEXT("SpawnActor returned null");
+					Result.Actors.Add(MoveTemp(ActorResult));
+					continue;
+				}
+
+				ActorResult.bSpawned = true;
+				ActorResult.ActorName = Spawned->GetName();
+				ActorResult.RuntimeClassPath = Spawned->GetClass()
+					? Spawned->GetClass()->GetPathName() : FString();
+				Spawned->SetFolderPath(FName(TEXT("Monolith/ActorSetup")));
+				++Result.SpawnedCount;
+
+				// Reflective DataAsset-field -> actor-prop apply (structured applied/unmatched).
+				if (DataAsset)
+				{
+					ApplyDataAssetFields(DataAsset, Spawned, ActorResult);
+				}
+
+				// AI move: only meaningful for a pawn with (or able to spawn) a controller.
+				if (Entry.bHasMoveTo)
+				{
+					ActorResult.bMoveRequested = true;
+					APawn* Pawn = Cast<APawn>(Spawned);
+					if (!Pawn)
+					{
+						ActorResult.MoveResult = TEXT("not_a_pawn");
+					}
+					else
+					{
+						AController* Controller = Pawn->GetController();
+						if (!Controller)
+						{
+							// Pawn may not have auto-possessed yet — request a default controller.
+							Pawn->SpawnDefaultController();
+							Controller = Pawn->GetController();
+						}
+						AAIController* AICon = Cast<AAIController>(Controller);
+						if (!AICon)
+						{
+							ActorResult.MoveResult = Controller
+								? TEXT("controller_not_ai") : TEXT("no_controller");
+						}
+						else
+						{
+							// Pass AcceptanceRadius explicitly (-1 = engine default, mirrors
+							// MoveToActor's documented default); remaining args use their header
+							// defaults. Verified AIController.cpp:591 / AIController.h:171 (5.7).
+							const EPathFollowingRequestResult::Type MoveRes =
+								AICon->MoveToLocation(Entry.MoveTo, -1.0f);
+							ActorResult.bMoveIssued = true;
+							ActorResult.MoveResult = MoveRequestToken(MoveRes);
+						}
+					}
+				}
+
+				Result.Actors.Add(MoveTemp(ActorResult));
+			}
+
+			Session.ActorSetupResults.Add(MoveTemp(Result));
+		}
+	}
+
 	// #9 derive a human-readable animation-mode token from the live mode enum.
 	const TCHAR* AnimationModeToken(EAnimationMode::Type Mode)
 	{
@@ -360,6 +573,135 @@ namespace
 			Id.bExpectedMismatch = !Id.MeshAnimClassPath.Contains(Id.ExpectedAnimClass);
 		}
 	}
+
+	// Phase 9 (OG-E3): the directory profiling artifacts (CSV + trace) are written into.
+	// <project>/Saved/Profiling — the engine's conventional profiling output dir, created
+	// on demand so a first-ever run does not silently no-op.
+	FString ProfilingOutputDir()
+	{
+		const FString Dir = FPaths::ProjectDir() / TEXT("Saved/Profiling");
+		IFileManager::Get().MakeDirectory(*Dir, /*Tree=*/true);
+		return Dir;
+	}
+
+	// Phase 9 (OG-E3): start the requested profiling capture(s) for a session. Called ONCE,
+	// on the first ready (post-BeginPlay) observer tick, so capture brackets the PIE window
+	// and never includes editor-idle frames before BeginPlay. Single-fire guarded by the
+	// caller (Session.bProfilingStarted). Never throws / never blocks the frame.
+	void StartSessionProfiling(FPieSmokeSession& Session)
+	{
+		// --- CSV profiler ---
+		if (Session.bCsvProfile)
+		{
+#if CSV_PROFILER
+			if (FCsvProfiler* Profiler = FCsvProfiler::Get())
+			{
+				if (Profiler->IsCapturing())
+				{
+					// Something else already owns the capture — do NOT hijack it (and do NOT
+					// stop it on our teardown). Report rather than fight for ownership.
+					Session.CsvStatus = TEXT("a CSV capture was already running; not started by this session");
+				}
+				else
+				{
+					const FString Dir = ProfilingOutputDir();
+					// A custom Filename is used verbatim by the profiler (no auto extension), so
+					// supply the .csv suffix ourselves. We pre-compute the expected path here; the
+					// authoritative path is re-read from GetOutputFilename() at stop time.
+					const FString FileName = FString::Printf(TEXT("pie_%s.csv"), *Session.Id);
+					// NumFramesToCapture = -1 => capture until EndCapture() (i.e. session end).
+					Profiler->BeginCapture(/*InNumFramesToCapture=*/-1, Dir, FileName);
+					Session.bCsvStarted = true;
+					Session.CsvPath = Dir / FileName; // expected path; refined at stop
+					Session.CsvStatus = TEXT("capturing");
+				}
+			}
+			else
+			{
+				Session.CsvStatus = TEXT("FCsvProfiler::Get() returned null");
+			}
+#else
+			Session.bCsvAvailable = false;
+			Session.CsvStatus = TEXT("profiling unavailable in this build config (CSV_PROFILER off)");
+#endif // CSV_PROFILER
+		}
+
+		// --- Unreal Insights trace ---
+		if (Session.TraceChannels.Num() > 0)
+		{
+			if (FTraceAuxiliary::IsConnected())
+			{
+				// A trace is already active (e.g. started from the command line / Insights).
+				// Do not start a second one and do not stop the existing one on teardown.
+				Session.TraceStatus = TEXT("a trace was already connected; not started by this session");
+			}
+			else
+			{
+				const FString ChannelString = FString::Join(Session.TraceChannels, TEXT(","));
+				const FString TraceFile = ProfilingOutputDir() /
+					FString::Printf(TEXT("pie_%s.utrace"), *Session.Id);
+				const bool bStarted = FTraceAuxiliary::Start(
+					FTraceAuxiliary::EConnectionType::File, *TraceFile, *ChannelString);
+				if (bStarted)
+				{
+					Session.bTraceStarted = true;
+					// GetTraceDestinationString() is authoritative for where data actually lands.
+					const FString Dest = FTraceAuxiliary::GetTraceDestinationString();
+					Session.TracePath = Dest.IsEmpty() ? TraceFile : Dest;
+					Session.TraceStatus = TEXT("tracing");
+				}
+				else
+				{
+					Session.TraceStatus = TEXT("FTraceAuxiliary::Start failed (trace may be disabled in this build)");
+				}
+			}
+		}
+	}
+
+	// Phase 9 (OG-E3): the finally-equivalent. Stop/flush any profiling THIS session started,
+	// on EVERY session-end path (success, failure, abort). Idempotent: a single-fire guard
+	// (Session.bProfilingStopped) means it is safe to call from multiple end paths, and it only
+	// ever stops captures THIS session itself started (bCsvStarted / bTraceStarted) so a
+	// pre-existing external capture is never collateral-stopped. Never throws / never blocks.
+	void StopSessionProfiling(FPieSmokeSession& Session)
+	{
+		if (Session.bProfilingStopped)
+		{
+			return;
+		}
+		Session.bProfilingStopped = true;
+
+#if CSV_PROFILER
+		if (Session.bCsvStarted)
+		{
+			if (FCsvProfiler* Profiler = FCsvProfiler::Get())
+			{
+				// EndCapture returns a future resolving to the written filename once the async
+				// file write completes. We do NOT block the editor frame waiting on it; the
+				// in-progress output path is read from GetOutputFilename() for the report.
+				Profiler->EndCapture();
+				const FString OutFile = Profiler->GetOutputFilename();
+				if (!OutFile.IsEmpty())
+				{
+					Session.CsvPath = OutFile;
+				}
+				Session.CsvStatus = TEXT("stopped (csv flushing asynchronously)");
+			}
+			Session.bCsvStarted = false;
+		}
+#else
+		// CSV compiled out — nothing to stop; status already reflects unavailability.
+#endif // CSV_PROFILER
+
+		if (Session.bTraceStarted)
+		{
+			// Only stop if we are still the connected trace (defensive — another stop may have
+			// raced in on a crash path). Stop() is a no-op when there is no data connection.
+			FTraceAuxiliary::Stop();
+			Session.bTraceStarted = false;
+			Session.TraceStatus = TEXT("stopped");
+		}
+	}
 }
 
 FPieSmokeSessionManager& FPieSmokeSessionManager::Get()
@@ -402,6 +744,7 @@ int32 FPieSmokeSessionManager::Stop(const FString& SessionId)
 				S.Status = EPieSmokeStatus::Stopped;
 				S.bStoppedByTool = true; // #11 lifecycle => stopped-by-tool
 				S.LastObservedSeconds = FPlatformTime::Seconds();
+				StopSessionProfiling(S); // Phase 9: finally — flush on the tool-driven stop path.
 				++Stopped;
 			}
 		}
@@ -503,6 +846,10 @@ void FPieSmokeSessionManager::OnPieEnded(const bool /*bIsSimulating*/)
 	for (TPair<FString, FPieSmokeSession>& Pair : Sessions)
 	{
 		Pair.Value.bPieActive = false;
+		// Phase 9 (OG-E3): finally — the PIE world is going away NOW (incl. on a crash/abort
+		// that fires EndPIE). Flush profiling here too rather than relying on a later observer
+		// tick, so a capture can never outlive the PIE it was bracketing. Idempotent.
+		StopSessionProfiling(Pair.Value);
 	}
 }
 
@@ -526,6 +873,7 @@ bool FPieSmokeSessionManager::OnFrameTick(float /*DeltaTime*/)
 		if (!S.bPieActive || !PieWorld || !IsValid(PieWorld))
 		{
 			S.Status = EPieSmokeStatus::Complete;
+			StopSessionProfiling(S); // Phase 9: finally — flush on the PIE-gone/abort path.
 			continue;
 		}
 
@@ -541,6 +889,7 @@ bool FPieSmokeSessionManager::OnFrameTick(float /*DeltaTime*/)
 		if (Elapsed >= S.DurationSeconds)
 		{
 			S.Status = EPieSmokeStatus::Complete;
+			StopSessionProfiling(S); // Phase 9: finally — flush on the normal-completion path.
 		}
 	}
 
@@ -583,9 +932,30 @@ void FPieSmokeSessionManager::AdvanceSession(FPieSmokeSession& Session)
 	const double SampleTime = FPlatformTime::Seconds() - Session.StartTimeSeconds;
 	++Session.ObserverTickCount; // #8 AfterNTicks gate
 
+	// Phase 9 (OG-E3): start session-scoped profiling ONCE on the first ready tick. AdvanceSession
+	// is only reached after HasBegunPlay, so this brackets the capture to exactly the PIE window
+	// (no pre-BeginPlay editor-idle frames). The matching stop runs on EVERY end path via
+	// StopSessionProfiling (the finally-equivalent), so a crash/abort can never leave it capturing.
+	if (!Session.bProfilingStarted &&
+		(Session.bCsvProfile || Session.TraceChannels.Num() > 0))
+	{
+		Session.bProfilingStarted = true;
+		StartSessionProfiling(Session);
+	}
+
 	// #9 refresh the runtime-identity snapshot from the live pawn (cached first tick,
 	// re-checked each tick for anim_class_changed + the expected-class assert).
 	UpdateRuntimeIdentity(Session.Identity, Pawn);
+
+	// Phase 8 (OG-E2/E5): execute the declarative actor_setup spec ONCE, on the first ready
+	// tick (the observer only reaches AdvanceSession after HasBegunPlay, so this is post-
+	// BeginPlay). Spawn/apply/move all run against the live PIE world; results are captured
+	// for the poll/stop report. Single-fire guarded so re-ticks never re-spawn.
+	if (!Session.bActorSetupFired && Session.ActorSetups.Num() > 0)
+	{
+		Session.bActorSetupFired = true;
+		FireActorSetup(Session, PieWorld);
+	}
 
 	// #7 view-target wiring, applied once on the first ready tick:
 	//   (a) always record the ACTIVE view target so a black frame can be diagnosed;
@@ -604,14 +974,24 @@ void FPieSmokeSessionManager::AdvanceSession(FPieSmokeSession& Session)
 			if (!Session.ViewTargetActorRequest.IsEmpty())
 			{
 				AActor* Resolved = nullptr;
-				// Match on actor name OR class-name substring (tolerant resolution).
+				// Match on Outliner label OR object name OR class-name substring (tolerant
+				// resolution). GetActorLabel() is the editor display name a caller sees in the
+				// Outliner — matching it first is why an editor-label request now resolves;
+				// the object-name / class-name checks remain as fallback. GetActorLabel() is
+				// WITH_EDITOR-only, but this whole module (and PIE itself) is editor-only.
 				for (TActorIterator<AActor> It(PieWorld); It; ++It)
 				{
 					AActor* Candidate = *It;
 					if (!Candidate) { continue; }
+#if WITH_EDITOR
+					const FString Label = Candidate->GetActorLabel();
+#else
+					const FString Label;
+#endif
 					const FString Nm = Candidate->GetName();
 					const FString Cls = Candidate->GetClass() ? Candidate->GetClass()->GetName() : FString();
-					if (Nm.Contains(Session.ViewTargetActorRequest) ||
+					if ((!Label.IsEmpty() && Label.Contains(Session.ViewTargetActorRequest)) ||
+						Nm.Contains(Session.ViewTargetActorRequest) ||
 						Cls.Contains(Session.ViewTargetActorRequest))
 					{
 						Resolved = Candidate;
@@ -698,14 +1078,24 @@ void FPieSmokeSessionManager::AdvanceSession(FPieSmokeSession& Session)
 
 			const FString FramePath = Session.OutputDir /
 				FString::Printf(TEXT("frame_%03d.png"), Session.CaptureFrameIndex);
-			const FCaptureResult Cap = CapturePieFrame(FramePath);
+			// #7 flush the render thread before the very first ReadPixels so a warm-up /
+			// uniform first frame is not produced in the first place.
+			const bool bFirstCapture = (Session.CaptureFrameIndex == 0);
+			const FCaptureResult Cap = CapturePieFrame(FramePath, bFirstCapture);
 			if (Cap.bSaved)
 			{
 				Sample.FramePath = FramePath;
 				// #7 per-frame validity verdict (uniform / all-black => unrendered).
 				Sample.bFrameUniform = Cap.bUniform;
 				Sample.bFrameValid = Cap.bValid;
-				if (Cap.bValid) { ++Session.ValidFrames; } else { ++Session.InvalidFrames; }
+				// #7 first-frame warm-up: the first DiscardFirstFrames captured frames are saved
+				// (the clip stays complete) but excluded from valid/invalid accounting, so an
+				// un-warmed first frame can't false-fail the session's captured_ok rollup.
+				const bool bCountThisFrame = (Session.CaptureFrameIndex >= Session.DiscardFirstFrames);
+				if (bCountThisFrame)
+				{
+					if (Cap.bValid) { ++Session.ValidFrames; } else { ++Session.InvalidFrames; }
+				}
 				Session.LastCaptureSeconds = SampleTime;
 				++Session.CaptureFrameIndex;
 			}

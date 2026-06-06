@@ -134,6 +134,11 @@ public:
 	// actor instances), rebuild + validate nav via runtime `ai` dispatch, save.
 	static FMonolithActionResult HandleCreateNavHarnessMap(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Generic map settings authoring (Phase 10 / OG-E4, plan 2026-06-07) ---
+	// Set WorldSettings GameMode override + spawn APlayerStart actors (+ optional generic
+	// actor instances with reflective UPROPERTY defaults) on the open / specified map.
+	static FMonolithActionResult HandleAuthorMapSettings(const TSharedPtr<FJsonObject>& Params);
+
 	static void OnLiveCodingPatchComplete();
 
 private:
