@@ -8,19 +8,19 @@
 
 ## MonolithBlueprint
 
-**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, BlueprintGraph, Json, JsonUtilities
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, BlueprintGraph, EnhancedInput, Json, JsonUtilities
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 109 blueprint actions |
+| `FMonolithBlueprintModule` | Registers ~115 blueprint actions (count approximate — query `monolith_discover("blueprint")` for the live figure) |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
 > **Unity-safe file-local helpers (#68).** Internal-linkage helpers (anonymous-namespace functions/types, file-`static`s) must carry file-unique names or live in per-file named namespaces — matching the MonolithUI model — so they don't collide when adaptive/full unity concatenates same-module `.cpp`s into one translation unit. (The previously-global `InterpModeToString` in `MonolithBlueprintNodeActions.cpp` is now `NodeInterpModeToString`.)
 
-### Actions (109 — namespace: "blueprint")
+### Actions (~115 — namespace: "blueprint")
 
 > **Per-module baseline note (2026-05-23):** this file's baseline was 92 (it carries the 2026-05-22 `add_property_access` +1 but predates the Phase 2 `override_parent_function` / `save_dirty_assets` +2 that SPEC_CORE §12 already folded into its authoritative 94). Part B adds +17 (dataset ergonomics, below), so this file's count moves 92 → 109 while §12's authoritative `blueprint` row moves 94 → 111. The residual 2-action gap (this file's 109 vs §12's 111) is the pre-existing Phase 2 drift §12's reconciliation notes already track — deferred to the next holistic count-audit, not patched here.
 
@@ -112,6 +112,19 @@
 |--------|--------|-------------|
 | `spawn_blueprint_actor` | `blueprint`, `location`?, `rotation`?, `scale`?, `label`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn a Blueprint actor into the editor world with full transform, property reflection, tags, sublevel targeting, and mobility control. Uses `GEditor->AddActor` for proper editor integration (undo/redo). Default folder: `"Blueprints"` |
 | `batch_spawn_blueprint_actors` | `blueprint`, `count`, `pattern`?, `origin`?, `spacing`?, `columns`?, `direction`?, `rotation`?, `scale`?, `label_prefix`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn multiple Blueprint actors in a grid or linear pattern. Partial failure semantics — continues on per-actor failure, reports successes and failures separately. Single undo transaction. Max 1000 |
+
+**Motion Matching scaffolding (6 — 2026-06-07)** — high-level Blueprint authoring for a Motion-Matching-driven character, the BP-side companion to the `animation` Motion Matching action pack.
+
+| Action | Params | Description |
+|--------|--------|-------------|
+| `set_anim_class` | `asset_path`, `anim_class` | Set the `AnimClass` (Anim Blueprint) on a character/pawn Blueprint's skeletal mesh component (SCS or inherited native), resolving the class from a path/name. |
+| `apply_movement_preset` | `asset_path`, `preset` | Apply a named `UCharacterMovementComponent` tuning preset (bulk CDO write of the movement-component defaults). |
+| `add_engine_component_typed` | `asset_path`, `component_class`, `component_name` | Add an engine-typed component to a Blueprint, resolving `component_class` from a path/name (the typed companion to `add_component`). |
+| `scaffold_locomotion_input` | `asset_path`, ... | Scaffold locomotion Enhanced Input wiring (input action / mapping references) on a character Blueprint. |
+| `validate_animbp_variable_contract` | `asset_path`, ... | Validate that a character Blueprint's Anim Blueprint exposes the variables the locomotion/motion-matching graph expects (the variable contract), reporting missing/mismatched entries. Read-only. |
+| `scaffold_motion_matching_character` | `asset_path`, ... | Composite: assemble a Motion-Matching-ready character Blueprint — anim class, movement preset, components, locomotion input, and the variable contract — in one call. |
+
+> **`EnhancedInput` dep (2026-06-07)** added to `MonolithBlueprint.Build.cs` for `scaffold_locomotion_input` (Enhanced Input action / mapping-context resolution).
 
 **CDO Bulk Fill / Describe (Phase 1 of bulk_fill framework — 2)**
 | Action | Params | Description |

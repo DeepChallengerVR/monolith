@@ -8,19 +8,21 @@
 
 ## MonolithAnimation
 
-**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AnimGraph, AnimGraphRuntime, BlueprintGraph, AnimationBlueprintLibrary, PoseSearch, AnimationModifiers, EditorScriptingUtilities, Json, JsonUtilities
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AnimGraph, AnimGraphRuntime, BlueprintGraph, AnimationBlueprintLibrary, PoseSearch, BlendStackEditor, AnimationModifiers, EditorScriptingUtilities, Json, JsonUtilities
+
+> **`BlendStackEditor` dep (2026-06-07)** added for the Motion Matching action pack — `build_motion_matching_node` spawns the bound-graph `UAnimGraphNode_MotionMatching` / BlendStack nodes.
 
 ### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers ~135 animation actions across `MonolithAnimationActions.cpp` (incl. the state-machine authoring actions `create_state_machine` / `build_state_machine`, plus 2026-06-07 readback actions `get_anim_graph_choosers` / `get_transition_rule`), `MonolithPoseSearchActions.cpp` (13), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), `MonolithAnimationRuntimeActions.cpp` (1 — `sample_pie_anim_instance`), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`). The `WITH_CHOOSER`-gated `chooser` namespace (6 actions) is registered from this module but counted under its own namespace |
+| `FMonolithAnimationModule` | Registers ~150 animation actions across `MonolithAnimationActions.cpp` (incl. the state-machine authoring actions `create_state_machine` / `build_state_machine`, plus 2026-06-07 readback actions `get_anim_graph_choosers` / `get_transition_rule`), `MonolithPoseSearchActions.cpp` (PoseSearch + the 2026-06-07 Motion Matching action pack), `MonolithAbpWriteActions.cpp` (5), `MonolithControlRigWriteActions.cpp` (3), `MonolithAnimLayoutActions.cpp` (1), `MonolithAnimationRuntimeActions.cpp` (1 — `sample_pie_anim_instance`), and the 5 graph-surgery actions (`rebuild_evaluate_chooser_node`, `replace_evaluate_chooser_nodes`, `duplicate_reparent_and_sanitize`, `find_node_slice`, `remove_node_slice`). The `WITH_CHOOSER`-gated `chooser` namespace (6 actions) is registered from this module but counted under its own namespace |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups (the original action handlers) |
 | `FMonolithAbpWriteActions` | ABP graph write actions (Phase v0.14.3 PR #34): `add_anim_graph_node` (built-in aliases plus generic `UAnimGraphNode_Base` class path/name resolution, with TwoBoneIK / ModifyBone helpers and auto-pin exposure), `connect_anim_graph_pins`, `set_state_animation`, `add_variable_get`, `set_anim_graph_node_property` |
 | `FMonolithControlRigWriteActions` | ControlRig write actions: 3 actions (graph node creation, pin configuration, variable management) |
 | `FMonolithAnimLayoutActions` | `auto_layout` for AnimBP graphs |
 
-### Actions (~135 — namespace: "animation")
+### Actions (~150 — namespace: "animation")
 
 > **Counts are approximate.** Exact integers are no longer tracked to the unit — query `monolith_discover("animation")` for the live figure.
 
@@ -145,7 +147,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `add_composite_segment` | Add a segment to an animation composite |
 | `remove_composite_segment` | Remove a segment from an animation composite by index |
 
-**PoseSearch (13)**
+**PoseSearch (~12 core; +14 Motion Matching pack below)**
 | Action | Description |
 |--------|-------------|
 | `get_pose_search_schema` | Get PoseSearch schema config and channels |
@@ -158,16 +160,43 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `set_database_sequence_properties` | Set per-sequence properties (looping, mirror option, sample range) |
 | `add_schema_channel` | Add a channel to a PoseSearch schema |
 | `remove_schema_channel` | Remove a channel from a PoseSearch schema |
-| (3 additional PoseSearch actions registered — see `MonolithPoseSearchActions.cpp` for the full list; this section is approximate while the per-action audit catches up) |
+| `set_channel_weight` | Set the weight on a PoseSearch schema channel |
+| `rebuild_pose_search_index` | Rebuild a PoseSearch database's search index |
+| `set_database_search_mode` | Set a PoseSearch database's search mode |
+
+**Note:** `get_database_stats` is hardened against unbuilt databases (it previously asserted on a PoseSearch database with no built search index — see Fixes below). `get_database_stats` and `get_pose_search_schema` also gained read-back fields surfacing additional database/schema state (enhancement, no count delta).
+
+**Motion Matching action pack (14 — 2026-06-07)** — namespace `animation`. End-to-end authoring surface for UE 5.7 Motion Matching: PoseSearch normalization sets, asset-type-agnostic database entries, schema mirroring/channels, notifies, validation, and the Pose-History / Motion-Matching anim-graph nodes.
+
+| Action | Description |
+|--------|-------------|
+| `create_normalization_set` | Create a `UPoseSearchNormalizationSet` asset (shared cost normalization across databases). |
+| `add_database_to_normalization_set` | Add a PoseSearch database to a normalization set. |
+| `set_database_normalization_set` | Assign a normalization set to a PoseSearch database. |
+| `add_database_entry` | Add a database entry, asset-type-agnostic (`UAnimSequence` / `UBlendSpace` / `UAnimComposite` / `UAnimMontage`) via the unified 5.7 `FPoseSearchDatabaseAnimationAsset` discriminated shape. |
+| `set_database_entry_tags` | Set the tags on a database entry. |
+| `create_mirror_data_table` | Create a `UMirrorDataTable` asset for mirrored-pose matching. |
+| `set_schema_mirror_data_table` | Assign a mirror data table to a PoseSearch schema. |
+| `configure_schema_channel` | Configure an existing schema channel's properties via reflection. |
+| `add_pose_search_notify` | Add a PoseSearch notify-state to a sequence — supports 8 notify-state kinds. |
+| `derive_schema_channels_from_skeleton` | Derive schema channels (bone/trajectory sampling) from the target skeleton automatically. |
+| `validate_pose_search_database` | Validate a PoseSearch database (schema/entry/normalization consistency + build state). |
+| `configure_pose_history_node` | Configure a Pose-History anim-graph node (`UAnimGraphNode_PoseHistory`) in an ABP. |
+| `configure_motion_matching_node` | Configure a Motion-Matching anim-graph node (database, schema, settings) in an ABP. |
+| `build_motion_matching_node` | Composite: spawn + wire + configure a Motion-Matching node (with its Pose-History) in one call. |
 
 **ABP Write (5) — v0.14.3 PR #34 by @MaxenceEpitech**
 | Action | Description |
 |--------|-------------|
-| `add_anim_graph_node` | Place an animation graph node. `node_type` still accepts the existing aliases (`SequencePlayer`, `BlendSpacePlayer`, `TwoWayBlend`, `BlendListByBool`, `LayeredBoneBlend`, `MotionMatching`, `TwoBoneIK`, `ModifyBone`, `LocalToComponentSpace`, `ComponentToLocalSpace`) and may also be a class path/name for legacy clients. New `node_class` accepts any loaded non-abstract `UAnimGraphNode_Base` subclass by class path or name. Rejects missing, ambiguous, non-`UAnimGraphNode_Base`, abstract, and unresolved classes with actionable errors. TwoBoneIK auto-exposes `EffectorLocation`, `JointTargetLocation`, `Alpha` as input pins; `expose_pins` manually controls optional pins on any node type |
+| `add_anim_graph_node` | Place an animation graph node. `node_type` still accepts the existing aliases (`SequencePlayer`, `BlendSpacePlayer`, `TwoWayBlend`, `BlendListByBool`, `LayeredBoneBlend`, `MotionMatching`, `TwoBoneIK`, `ModifyBone`, `LocalToComponentSpace`, `ComponentToLocalSpace`, plus 2026-06-07 `pose_history` + `inertialization` aliases) and may also be a class path/name for legacy clients. New `node_class` accepts any loaded non-abstract `UAnimGraphNode_Base` subclass by class path or name. Rejects missing, ambiguous, non-`UAnimGraphNode_Base`, abstract, and unresolved classes with actionable errors. TwoBoneIK auto-exposes `EffectorLocation`, `JointTargetLocation`, `Alpha` as input pins; `expose_pins` manually controls optional pins on any node type |
 | `connect_anim_graph_pins` | Wire two pins inside an ABP graph |
 | `set_state_animation` | Assign an animation asset to a state machine state |
 | `add_variable_get` | Place a `K2Node_VariableGet` in an ABP anim graph for reading AnimInstance member variables. Validates the variable exists on the skeleton class before spawning |
 | `set_anim_graph_node_property` | Set a property on a previously-placed anim graph node via reflection |
+
+**Fixes (2026-06-07)**
+- `add_anim_graph_node` — fixed a pre-existing crash when spawning bound-graph nodes (BlendStack / MotionMatching); the spawn path now uses `FGraphNodeCreator` so the node's bound graph is constructed correctly.
+- `get_database_stats` — fixed a pre-existing crash that asserted on a PoseSearch database with no built search index (unbuilt database). Now returns stats / a clear state instead of asserting.
 
 **ControlRig Write (3)**
 | Action | Description |
@@ -268,9 +297,9 @@ Full free-form **expression-graph** authoring (e.g. `Abs(X) > 45.0`) is **deferr
 
 ---
 
-## Chooser Namespace (6 — namespace: "chooser")
+## Chooser Namespace (9 — namespace: "chooser")
 
-A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All six actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
+A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
 
 | Action | Description |
 |--------|-------------|
@@ -280,5 +309,13 @@ A dedicated namespace for inspecting and editing `UChooserTable` assets, registe
 | `set_result_asset_reference` | Rewrite the `Asset` reference on a result row (`FAssetChooser` / `FSoftAssetChooser`), e.g. a PoseSearch database. Rejects non-asset result rows (e.g. `NestedChooser` / EvaluateChooser) with a precise error — use `set_evaluate_chooser_result_reference` for those. Marks the package dirty and recompiles (`Compile(true)`). |
 | `set_evaluate_chooser_result_reference` | Rewrite the child `UChooserTable` that an EvaluateChooser result row points at (`FEvaluateChooser`). Root / nested chooser rows are EvaluateChooser rows and are NOT settable via `set_result_asset_reference`; this action handles them. Params: `asset_path` (required, the table to edit), `row` (required, 0-based result row index of the EvaluateChooser row), `child_chooser_path` (required, the `UChooserTable` to point it at). Marks the package dirty and recompiles (`Compile(true)`). |
 | `validate_chooser` | `Compile(true)` plus validation: optional `expected_context_class` and `expected_result_type` (`ObjectResult` / `ClassResult` / `NoPrimaryResult`), plus a sweep for null / stale result-row asset references. Read-only apart from the compile pass. |
+
+**Chooser authoring (3 — 2026-06-07)** — create a chooser table from scratch and populate it row-by-row, the companion write surface to the inspect/edit/duplicate actions above.
+
+| Action | Description |
+|--------|-------------|
+| `create_chooser_table` | Create a new `UChooserTable`. Sets `output_type` (`ObjectResult` (default) / `ClassResult` / `NoPrimaryResult`; `Object` aliased to `ObjectResult`), an optional `output_class` (the Result Class — resolved from a class path/name, e.g. an ABP `_C` or `PoseSearchDatabase`), and an optional `context_class` added as a `FContextObjectTypeClass` parameter. Marks the package dirty. |
+| `add_chooser_column` | Append a column. `column_kind` is `Bool` / `Enum` / `GameplayTag` / `FloatRange` / `OutputObject`. Input (filter) columns take an optional `binding_property` dotted path setting the `InputValue` binding chain. The new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty. |
+| `add_chooser_row` | Append a row. `cells` is one entry per INPUT column in column order (`Bool`: bool/`any`; `Enum`: int; `FloatRange`: `{min,max}`; `GameplayTag`: tag string); `output_psd` is the asset the row selects (written as an `FAssetChooser` result). Every parallel array (per-column value arrays, `OutputObject` `RowValues`, `ResultsStructs`, `DisabledRows`) grows by exactly 1 atomically. Marks the package dirty. |
 
 ---
