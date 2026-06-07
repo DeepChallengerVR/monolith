@@ -53,6 +53,7 @@ void FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry& Re
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
 			.Required(TEXT("column_kind"), TEXT("string"), TEXT("Bool | Enum | GameplayTag | FloatRange | OutputObject"))
 			.Optional(TEXT("binding_property"), TEXT("string"), TEXT("Optional dotted property path for the input binding chain (e.g. 'bIsCrouching' or 'Movement.Speed'). Input columns only."))
+			.Optional(TEXT("enum_class"), TEXT("string"), TEXT("Enum columns only: full path or bare short name of the UEnum this column filters (e.g. '/Script/MyModule.EStance' or 'EStance'). Sets the editor-side enum binding so cell values display/validate against this enum."))
 			.Build());
 
 	// --- add_chooser_row ---
@@ -63,6 +64,22 @@ void FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry& Re
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
 			.Required(TEXT("cells"), TEXT("array"), TEXT("One cell per INPUT column in column order. Bool: bool or 'any'; Enum: integer; FloatRange: {min:number,max:number}; GameplayTag: tag string."))
 			.RequiredAssetPath(TEXT("output_psd"), TEXT("Asset this row selects (e.g. a PoseSearch database). Written as an FAssetChooser result row."))
+			.Build());
+
+	// --- set_chooser_cell ---
+	Registry.RegisterAction(TEXT("chooser"), TEXT("set_chooser_cell"),
+		TEXT("Set a typed predicate value into a specific (column_index, row_index) cell of a UChooserTable. The accepted value fields depend on the column's concrete kind: Bool -> bool_value (bool) or 'any'; Enum -> enum_value (integer) [+ optional comparison: MatchEqual/MatchNotEqual/MatchAny]; FloatRange -> float_min + float_max (numbers); GameplayTag -> tags (string or array of tag strings). Both indices are validated in range. Marks the package dirty."),
+		FMonolithActionHandler::CreateStatic(&HandleSetChooserCell),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
+			.Required(TEXT("column_index"), TEXT("number"), TEXT("Zero-based index into ColumnsStructs"))
+			.Required(TEXT("row_index"), TEXT("number"), TEXT("Zero-based row index (must be < row count)"))
+			.Optional(TEXT("bool_value"), TEXT("bool"), TEXT("Bool column: cell value (true/false). Omit and pass 'any' via this field as a string to match-any."))
+			.Optional(TEXT("enum_value"), TEXT("number"), TEXT("Enum column: raw integer enum value"))
+			.Optional(TEXT("comparison"), TEXT("string"), TEXT("Enum column: MatchEqual (default) / MatchNotEqual / MatchAny"))
+			.Optional(TEXT("float_min"), TEXT("number"), TEXT("FloatRange column: inclusive minimum"))
+			.Optional(TEXT("float_max"), TEXT("number"), TEXT("FloatRange column: inclusive maximum"))
+			.Optional(TEXT("tags"), TEXT("array"), TEXT("GameplayTag column: a single tag string or an array of tag strings"))
 			.Build());
 }
 
@@ -82,6 +99,7 @@ namespace
 FMonolithActionResult FMonolithChooserAuthoringActions::HandleCreateChooserTable(const TSharedPtr<FJsonObject>&) { return ChooserUnavailable(); }
 FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(const TSharedPtr<FJsonObject>&)  { return ChooserUnavailable(); }
 FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(const TSharedPtr<FJsonObject>&)     { return ChooserUnavailable(); }
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleSetChooserCell(const TSharedPtr<FJsonObject>&)   { return ChooserUnavailable(); }
 
 #else // WITH_CHOOSER
 
@@ -364,6 +382,149 @@ namespace
 			}
 		}
 	}
+
+	/**
+	 * Set the editor-side enum binding on an Enum column's InputValue so the column
+	 * filters/validates against a concrete UEnum. FEnumColumn has no direct Enum
+	 * member; the enum is owned by the InputValue's FChooserEnumPropertyBinding
+	 * (its `Enum` field, WITH_EDITORONLY_DATA). Returns false if the column is not
+	 * an Enum column or the binding chain is unexpected. No-op (returns true) when
+	 * not in an editor-only build (the binding field doesn't exist then).
+	 */
+	bool ApplyEnumClass(FInstancedStruct& Col, const UEnum* EnumType)
+	{
+		FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>();
+		if (!EnumC || !EnumType)
+		{
+			return false;
+		}
+		if (FChooserEnumPropertyBinding* EnumBinding = EnumC->InputValue.GetMutablePtr<FChooserEnumPropertyBinding>())
+		{
+			EnumBinding->Enum = EnumType;
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Write a typed predicate value into a SPECIFIC (already-existing) cell of an
+	 * input column, dispatched on the column's concrete kind. Unlike
+	 * SetInputCellFromJson (which targets the last appended row from a single JSON
+	 * cell value), this addresses an arbitrary RowIdx and reads the per-kind value
+	 * fields directly off the action params:
+	 *   Bool        -> bool_value (bool) OR bool_value=="any" string
+	 *   Enum        -> enum_value (int) [+ comparison string]
+	 *   FloatRange  -> float_min / float_max
+	 *   GameplayTag -> tags (string or array of strings)
+	 *   OutputObject-> (not handled here; outputs are authored via add_chooser_row)
+	 * RowIdx is assumed already validated against GetColumnRowCount by the caller.
+	 * Returns false + OutError on a kind/shape mismatch.
+	 */
+	bool SetCellAtRowFromParams(FInstancedStruct& Col, int32 RowIdx,
+		const TSharedPtr<FJsonObject>& Params, FString& OutError)
+	{
+		if (FBoolColumn* BoolC = Col.GetMutablePtr<FBoolColumn>())
+		{
+			if (!BoolC->RowValuesWithAny.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for Bool column"); return false; }
+
+			bool bVal = false;
+			FString SVal;
+			if (Params->TryGetBoolField(TEXT("bool_value"), bVal))
+			{
+				BoolC->RowValuesWithAny[RowIdx] = bVal ? EBoolColumnCellValue::MatchTrue : EBoolColumnCellValue::MatchFalse;
+				return true;
+			}
+			if (Params->TryGetStringField(TEXT("bool_value"), SVal) && SVal.Equals(TEXT("any"), ESearchCase::IgnoreCase))
+			{
+				BoolC->RowValuesWithAny[RowIdx] = EBoolColumnCellValue::MatchAny;
+				return true;
+			}
+			OutError = TEXT("Bool cell requires bool_value (bool) or 'any'");
+			return false;
+		}
+		if (FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>())
+		{
+			if (!EnumC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for Enum column"); return false; }
+
+			double NumVal = 0.0;
+			if (!Params->TryGetNumberField(TEXT("enum_value"), NumVal))
+			{
+				OutError = TEXT("Enum cell requires enum_value (integer)");
+				return false;
+			}
+			EnumC->RowValues[RowIdx].Value = static_cast<uint8>(static_cast<int32>(NumVal));
+
+			EEnumColumnCellValueComparison Cmp = EEnumColumnCellValueComparison::MatchEqual;
+			FString CmpStr;
+			if (Params->TryGetStringField(TEXT("comparison"), CmpStr))
+			{
+				if      (CmpStr.Equals(TEXT("MatchEqual"),    ESearchCase::IgnoreCase)) { Cmp = EEnumColumnCellValueComparison::MatchEqual; }
+				else if (CmpStr.Equals(TEXT("MatchNotEqual"), ESearchCase::IgnoreCase)) { Cmp = EEnumColumnCellValueComparison::MatchNotEqual; }
+				else if (CmpStr.Equals(TEXT("MatchAny"),      ESearchCase::IgnoreCase)) { Cmp = EEnumColumnCellValueComparison::MatchAny; }
+				else { OutError = FString::Printf(TEXT("Unrecognized comparison '%s'"), *CmpStr); return false; }
+			}
+			EnumC->RowValues[RowIdx].Comparison = Cmp;
+			return true;
+		}
+		if (FFloatRangeColumn* RangeC = Col.GetMutablePtr<FFloatRangeColumn>())
+		{
+			if (!RangeC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for FloatRange column"); return false; }
+
+			double MinV = 0.0, MaxV = 0.0;
+			const bool bHasMin = Params->TryGetNumberField(TEXT("float_min"), MinV);
+			const bool bHasMax = Params->TryGetNumberField(TEXT("float_max"), MaxV);
+			if (!bHasMin && !bHasMax)
+			{
+				OutError = TEXT("FloatRange cell requires float_min and/or float_max");
+				return false;
+			}
+			if (bHasMin) { RangeC->RowValues[RowIdx].Min = static_cast<float>(MinV); }
+			if (bHasMax) { RangeC->RowValues[RowIdx].Max = static_cast<float>(MaxV); }
+			return true;
+		}
+		if (FGameplayTagColumn* TagC = Col.GetMutablePtr<FGameplayTagColumn>())
+		{
+			if (!TagC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for GameplayTag column"); return false; }
+
+			// Accept either a single tag string or an array of tag strings.
+			TArray<FString> TagStrings;
+			const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
+			FString SingleTag;
+			if (Params->TryGetArrayField(TEXT("tags"), ArrPtr) && ArrPtr)
+			{
+				for (const TSharedPtr<FJsonValue>& V : *ArrPtr)
+				{
+					FString T;
+					if (V.IsValid() && V->TryGetString(T) && !T.IsEmpty()) { TagStrings.Add(T); }
+				}
+			}
+			else if (Params->TryGetStringField(TEXT("tags"), SingleTag) && !SingleTag.IsEmpty())
+			{
+				TagStrings.Add(SingleTag);
+			}
+			if (TagStrings.Num() == 0)
+			{
+				OutError = TEXT("GameplayTag cell requires tags (a tag string or array of tag strings)");
+				return false;
+			}
+
+			FGameplayTagContainer Container;
+			for (const FString& T : TagStrings)
+			{
+				const FGameplayTag Tag = UGameplayTagsManager::Get().RequestGameplayTag(FName(*T), /*ErrorIfNotFound=*/false);
+				if (!Tag.IsValid())
+				{
+					OutError = FString::Printf(TEXT("GameplayTag '%s' is not registered"), *T);
+					return false;
+				}
+				Container.AddTag(Tag);
+			}
+			TagC->RowValues[RowIdx] = MoveTemp(Container);
+			return true;
+		}
+		OutError = TEXT("column is not a writable input column (Bool/Enum/FloatRange/GameplayTag)");
+		return false;
+	}
 #endif // WITH_EDITORONLY_DATA
 }
 
@@ -463,6 +624,8 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 	const FString ColumnKind = Params->GetStringField(TEXT("column_kind"));
 	const FString BindingProp = Params->HasField(TEXT("binding_property"))
 		? Params->GetStringField(TEXT("binding_property")) : FString();
+	const FString EnumClassStr = Params->HasField(TEXT("enum_class"))
+		? Params->GetStringField(TEXT("enum_class")) : FString();
 
 	UChooserTable* Table = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(AssetPath);
 	if (!Table)
@@ -494,6 +657,28 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 		ApplyInputBinding(NewColumn, BindingProp);
 	}
 
+	// Optional explicit enum class for Enum columns — sets the editor-side enum
+	// binding so the column filters/validates against a concrete UEnum. FEnumColumn
+	// has no direct Enum member; the enum lives on the InputValue binding.
+	bool bEnumClassApplied = false;
+	if (ColumnKind.Equals(TEXT("Enum"), ESearchCase::IgnoreCase) && !EnumClassStr.IsEmpty())
+	{
+		const UEnum* EnumType = LoadObject<UEnum>(nullptr, *EnumClassStr);
+		if (!EnumType)
+		{
+			EnumType = FindFirstObject<UEnum>(*EnumClassStr, EFindFirstObjectOptions::NativeFirst);
+		}
+		if (EnumType)
+		{
+			bEnumClassApplied = ApplyEnumClass(NewColumn, EnumType);
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("enum_class '%s' could not be resolved to a UEnum"), *EnumClassStr));
+		}
+	}
+
 	// CRITICAL alignment step: back-fill the new column's per-row array to the
 	// CURRENT row count so every parallel array stays equal-length. Row count is
 	// the authoritative ResultsStructs length.
@@ -510,6 +695,7 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 	Root->SetStringField(TEXT("column_kind"), ColumnKind);
 	Root->SetBoolField(TEXT("is_input"), bIsInput);
 	Root->SetNumberField(TEXT("back_filled_rows"), CurrentRowCount);
+	Root->SetBoolField(TEXT("enum_class_applied"), bEnumClassApplied);
 	return FMonolithActionResult::Success(Root);
 #else
 	return FMonolithActionResult::Error(TEXT("ColumnsStructs is editor-only data; not available in this build"));
@@ -632,6 +818,74 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(cons
 	return FMonolithActionResult::Success(Root);
 #else
 	return FMonolithActionResult::Error(TEXT("ResultsStructs/ColumnsStructs are editor-only data; not available in this build"));
+#endif
+}
+
+// ===========================================================================
+// set_chooser_cell  (set a typed predicate value into a specific cell)
+// ===========================================================================
+
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleSetChooserCell(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	double ColIdxD = 0.0, RowIdxD = 0.0;
+	if (!Params->TryGetNumberField(TEXT("column_index"), ColIdxD))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: column_index"));
+	}
+	if (!Params->TryGetNumberField(TEXT("row_index"), RowIdxD))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: row_index"));
+	}
+	const int32 ColIdx = static_cast<int32>(ColIdxD);
+	const int32 RowIdx = static_cast<int32>(RowIdxD);
+
+	UChooserTable* Table = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(AssetPath);
+	if (!Table)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("ChooserTable not found: %s"), *AssetPath));
+	}
+
+#if WITH_EDITORONLY_DATA
+	if (!Table->ColumnsStructs.IsValidIndex(ColIdx))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("column_index %d out of range (column count %d)"), ColIdx, Table->ColumnsStructs.Num()));
+	}
+
+	FInstancedStruct& Col = Table->ColumnsStructs[ColIdx];
+
+	// Validate the row index against THIS column's per-row array (which the row
+	// authoring keeps aligned with ResultsStructs).
+	const int32 ColRowCount = GetColumnRowCount(Col);
+	if (ColRowCount == INDEX_NONE)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("column %d is not a recognized chooser column type"), ColIdx));
+	}
+	if (RowIdx < 0 || RowIdx >= ColRowCount)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("row_index %d out of range (row count %d)"), RowIdx, ColRowCount));
+	}
+
+	FString CellError;
+	if (!SetCellAtRowFromParams(Col, RowIdx, Params, CellError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("set_chooser_cell (column %d, row %d): %s"), ColIdx, RowIdx, *CellError));
+	}
+
+	Table->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Table->GetPathName());
+	Root->SetNumberField(TEXT("column_index"), ColIdx);
+	Root->SetNumberField(TEXT("row_index"), RowIdx);
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("ColumnsStructs are editor-only data; not available in this build"));
 #endif
 }
 

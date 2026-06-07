@@ -10,7 +10,8 @@
  * scratch and grow it column-by-column / row-by-row, keeping every parallel
  * per-row array aligned.
  *
- * 3 actions: create_chooser_table, add_chooser_column, add_chooser_row.
+ * 4 actions: create_chooser_table, add_chooser_column, add_chooser_row,
+ * set_chooser_cell.
  *
  * Operates on UChooserTable assets (Chooser plugin). All handlers are gated
  * behind WITH_CHOOSER; when the Chooser plugin is absent the off-gate stub
@@ -32,4 +33,5 @@ private:
 	static FMonolithActionResult HandleCreateChooserTable(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddChooserColumn(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddChooserRow(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetChooserCell(const TSharedPtr<FJsonObject>& Params);
 };
