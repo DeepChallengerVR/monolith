@@ -3,6 +3,7 @@
 #include "MonolithAnimationActions.h"
 #include "MonolithAnimationRuntimeActions.h"
 #include "MonolithPoseSearchActions.h"
+#include "MonolithMirrorTableActions.h"
 #include "MonolithControlRigWriteActions.h"
 #include "MonolithAbpWriteActions.h"
 #include "MonolithAnimLayoutActions.h"
@@ -18,6 +19,7 @@ void FMonolithAnimationModule::StartupModule()
 	FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMirrorTableActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithControlRigWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAnimLayoutActions::RegisterActions(FMonolithToolRegistry::Get());
