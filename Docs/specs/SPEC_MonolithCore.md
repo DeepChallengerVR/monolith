@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.14.11 (Beta)
+**Version:** 0.18.1 (Beta)
 
 ---
 
@@ -47,7 +47,7 @@
 
 ### Actions (2 — namespace: "bulk_fill")
 
-Framework-level dispatchers for transacted JSON-tree writes against any registered per-namespace adapter. Adapters live in their owning modules (`MonolithBlueprint`, `MonolithGAS`, `MonolithUI`, `MonolithAI`, `MonolithNiagara`, `MonolithMaterial`, `MonolithAudio`, `MonolithMesh`, `MonolithAnimation`, `MonolithLogicDriver`, `MonolithComboGraph`, and the sibling-plugin `inventory` adapter under `MonolithISX`); `MonolithCore` owns only the framework primitives and the dispatch surface.
+Framework-level dispatchers for transacted JSON-tree writes against any registered per-namespace adapter. Adapters live in their owning modules (`MonolithBlueprint`, `MonolithGAS`, `MonolithUI`, `MonolithAI`, `MonolithNiagara`, `MonolithMaterial`, `MonolithAudio`, `MonolithMesh`, `MonolithAnimation`, `MonolithLogicDriver`, `MonolithComboGraph`, and an optional sibling-plugin `inventory` adapter); `MonolithCore` owns only the framework primitives and the dispatch surface.
 
 | Action | MCP Tool | Description |
 |--------|----------|-------------|
