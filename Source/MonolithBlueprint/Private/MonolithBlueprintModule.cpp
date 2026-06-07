@@ -16,6 +16,7 @@
 #include "MonolithBlueprintGraphExportActions.h"
 #include "MonolithBlueprintLayoutActions.h"
 #include "MonolithBlueprintSpawnActions.h"
+#include "MonolithMotionMatchingScaffoldActions.h"
 #include "MonolithBlueprintBulkFillAdapter.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
@@ -45,6 +46,9 @@ void FMonolithBlueprintModule::StartupModule()
 	FMonolithBlueprintGraphExportActions::RegisterActions(Registry);
 	FMonolithBlueprintLayoutActions::RegisterActions(Registry);
 	FMonolithBlueprintSpawnActions::RegisterActions(Registry);
+
+	// Sprint 5 — Motion Matching Action Pack (Pillar D): character/actor BP scaffolding.
+	FMonolithMotionMatchingScaffoldActions::RegisterActions(Registry);
 
 	// Phase 1 bulk_fill / describe pilot adapter. Self-registers with
 	// FMonolithBulkFillRegistry under namespace "blueprint"; routed-to by the
