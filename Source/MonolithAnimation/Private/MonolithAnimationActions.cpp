@@ -2,6 +2,7 @@
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithPropertyAccessReader.h"
+#include "MonolithAnimNodeBindingReader.h" // Gap 2 (function bindings) + Gap 12 (pin bindings) read helpers
 
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
@@ -295,6 +296,65 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
 			.Optional(TEXT("recursive"), TEXT("bool"), TEXT("Expand each referenced chooser's full nested tree (root->child) in the output"), TEXT("false"))
+			.Build());
+
+	// --- Anim-node bindings: function (Gap 2) + pin property (Gap 12) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_anim_node_function_bindings"),
+		TEXT("Read the per-node function bindings (On Initial Update / On Become Relevant / On Update) on an animation graph node. ")
+		TEXT("Each binding reports function_name, member_parent_class, is_self_context and thread_safe. ")
+		TEXT("Omit node_id to list every node that has any non-empty function binding. ")
+		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_SequencePlayer_0' }."),
+		FMonolithActionHandler::CreateStatic(&HandleGetAnimNodeFunctionBindings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("node_id"), TEXT("string"), TEXT("Node name or NodeGuid. Omit to return all nodes that have any function binding."))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_anim_node_function_binding"),
+		TEXT("Bind (or clear) a function on an animation graph node's On Initial Update / On Become Relevant / On Update slot. ")
+		TEXT("Validates like the engine: the function must match the thread-safe anim-update prototype signature and be thread-safe ")
+		TEXT("(hard reject unless allow_non_thread_safe=true). Pass an empty function_name to clear. function_class targets an external ")
+		TEXT("library class; omit it to bind a function authored on the Animation Blueprint itself. ")
+		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_BlendSpacePlayer_0', binding: 'update', function_name: 'UpdateSpeed' }."),
+		FMonolithActionHandler::CreateStatic(&HandleSetAnimNodeFunctionBinding),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_id"), TEXT("string"), TEXT("Node name or NodeGuid"))
+			.Required(TEXT("binding"), TEXT("string"), TEXT("Which slot: initial_update | become_relevant | update"))
+			.Optional(TEXT("function_name"), TEXT("string"), TEXT("Function to bind. Empty/omitted clears the binding."))
+			.Optional(TEXT("function_class"), TEXT("string"), TEXT("External library class path for the function. Omit for a self-member on the Animation Blueprint."))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
+			.Optional(TEXT("recompile"), TEXT("bool"), TEXT("Recompile the Animation Blueprint after the change"), TEXT("true"))
+			.Optional(TEXT("allow_non_thread_safe"), TEXT("bool"), TEXT("Override the thread-safe hard reject (binding a non-thread-safe function can corrupt worker-thread anim evaluation)"), TEXT("false"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_anim_node_pin_bindings"),
+		TEXT("Read the property-access PIN bindings on an animation graph node (distinct from function bindings). ")
+		TEXT("Each entry reports pin, path (the property-access chain), type (Property/Function) and is_bound. ")
+		TEXT("Omit node_id to list every node that has any pin binding. ")
+		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_ModifyBone_0' }."),
+		FMonolithActionHandler::CreateStatic(&HandleGetAnimNodePinBindings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("node_id"), TEXT("string"), TEXT("Node name or NodeGuid. Omit to return all nodes that have any pin binding."))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_anim_node_pin_binding"),
+		TEXT("Bind (or clear) a PIN on an animation graph node to a property-access path. ")
+		TEXT("Pass path as a string array (e.g. ['CharacterState','Speed']); an empty/omitted path clears the binding. ")
+		TEXT("After the write the node is reconstructed so the binding's pin type is re-derived, then the Animation Blueprint is recompiled. ")
+		TEXT("v1 requires the node to already have a binding object (author one pin binding in-editor first if the node has none). ")
+		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_ModifyBone_0', pin: 'Alpha', path: ['CharacterState','Alpha'] }."),
+		FMonolithActionHandler::CreateStatic(&HandleSetAnimNodePinBinding),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_id"), TEXT("string"), TEXT("Node name or NodeGuid"))
+			.Required(TEXT("pin"), TEXT("string"), TEXT("Pin (property) name to bind"))
+			.Optional(TEXT("path"), TEXT("array"), TEXT("Property-access chain as a string array. Empty/omitted clears the binding."))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
+			.Optional(TEXT("recompile"), TEXT("bool"), TEXT("Recompile the Animation Blueprint after the change"), TEXT("true"))
 			.Build());
 
 	// Notify Editing
@@ -2240,6 +2300,13 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetNodes(const TSharedPtr
 				PinsArr.Add(MakeShared<FJsonValueObject>(PinObj));
 			}
 			NodeObj->SetArrayField(TEXT("connected_pins"), PinsArr);
+
+			// Gap 2 — compact function-binding block { initial_update/become_relevant/update:
+			// name-or-null }, omitted when all three are empty. Gap 12 — compact pin-binding
+			// list [{pin, path}], omitted when empty. Both keep the payload lean.
+			MonolithAnimNodeBindingReader::SerializeCompactFunctionBindings(AnimNode, NodeObj);
+			MonolithAnimNodeBindingReader::SerializeCompactPinBindings(AnimNode, NodeObj);
+
 			NodesArr.Add(MakeShared<FJsonValueObject>(NodeObj));
 		}
 	}
@@ -9613,5 +9680,472 @@ FMonolithActionResult FMonolithAnimationActions::HandleCopyBonePoseBetweenSequen
 	Root->SetArrayField(TEXT("copied_bones"), CopiedJson);
 	Root->SetArrayField(TEXT("skipped_bones"), SkippedJson);
 
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  Anim-node bindings — function (Gap 2) + pin property (Gap 12)
+//
+//  Function bindings: three public FMemberReference UPROPERTYs on
+//  UAnimGraphNode_Base. The setter mirrors UAnimGraphNode_Base::ValidateFunctionRef
+//  (AnimGraphNode_Base.cpp:259) — resolve UFunction, prototype-signature check,
+//  thread-safe gate — BEFORE writing the member, then recompile.
+//
+//  Pin bindings: reflective read/write of the unlinkable
+//  UAnimGraphNodeBinding_Base::PropertyBindings map. The setter mirrors the
+//  engine's own binding-widget write (AnimGraphNodeBinding_Base.cpp:486-503):
+//  build FAnimGraphNodePropertyBinding, add to the map, then ReconstructNode().
+// ============================================================
+
+namespace MonolithAnimNodeBindingHelpers
+{
+	// Resolve a UAnimGraphNode_Base in an AnimBP by node_id (matched against the
+	// node's GetName() OR its NodeGuid string — the serializer emits both forms).
+	// Walks every graph (anim graph + function graphs + sub-graphs) unless a
+	// graph_name filter is supplied.
+	static UAnimGraphNode_Base* FindAnimNode(UAnimBlueprint* ABP, const FString& NodeId, const FString& GraphFilter)
+	{
+		if (!ABP || NodeId.IsEmpty()) return nullptr;
+
+		TArray<UEdGraph*> AllGraphs;
+		ABP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph) continue;
+			if (!GraphFilter.IsEmpty() && Graph->GetName() != GraphFilter) continue;
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node);
+				if (!AnimNode) continue;
+				if (AnimNode->GetName() == NodeId || AnimNode->NodeGuid.ToString() == NodeId)
+				{
+					return AnimNode;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// Map the binding param value -> the matching FMemberReference UPROPERTY on the
+	// node, plus the property name (needed to read the PrototypeFunction metadata).
+	static FMemberReference* ResolveFunctionRef(UAnimGraphNode_Base* AnimNode, const FString& Binding, FName& OutPropertyName)
+	{
+		if (Binding == TEXT("initial_update"))
+		{
+			OutPropertyName = GET_MEMBER_NAME_CHECKED(UAnimGraphNode_Base, InitialUpdateFunction);
+			return &AnimNode->InitialUpdateFunction;
+		}
+		if (Binding == TEXT("become_relevant"))
+		{
+			OutPropertyName = GET_MEMBER_NAME_CHECKED(UAnimGraphNode_Base, BecomeRelevantFunction);
+			return &AnimNode->BecomeRelevantFunction;
+		}
+		if (Binding == TEXT("update"))
+		{
+			OutPropertyName = GET_MEMBER_NAME_CHECKED(UAnimGraphNode_Base, UpdateFunction);
+			return &AnimNode->UpdateFunction;
+		}
+		OutPropertyName = NAME_None;
+		return nullptr;
+	}
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetAnimNodeFunctionBindings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NodeId;
+	Params->TryGetStringField(TEXT("node_id"), NodeId);
+	FString GraphFilter;
+	Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	// Resolve the owning class for the thread_safe flag (skeleton class first, fall
+	// back to generated class) — mirrors the engine validator's resolution target.
+	UClass* OwnerClass = ABP->SkeletonGeneratedClass ? ABP->SkeletonGeneratedClass : ABP->GeneratedClass;
+
+	auto EmitNode = [OwnerClass](UAnimGraphNode_Base* AnimNode, UEdGraph* Graph) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+		NodeObj->SetStringField(TEXT("node_id"), AnimNode->GetName());
+		NodeObj->SetStringField(TEXT("node_guid"), AnimNode->NodeGuid.ToString());
+		NodeObj->SetStringField(TEXT("class"), AnimNode->GetClass()->GetName());
+		NodeObj->SetStringField(TEXT("title"), AnimNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+		if (Graph) NodeObj->SetStringField(TEXT("graph"), Graph->GetName());
+		NodeObj->SetObjectField(TEXT("initial_update"),
+			MonolithAnimNodeBindingReader::SerializeFunctionBinding(AnimNode->InitialUpdateFunction, OwnerClass));
+		NodeObj->SetObjectField(TEXT("become_relevant"),
+			MonolithAnimNodeBindingReader::SerializeFunctionBinding(AnimNode->BecomeRelevantFunction, OwnerClass));
+		NodeObj->SetObjectField(TEXT("update"),
+			MonolithAnimNodeBindingReader::SerializeFunctionBinding(AnimNode->UpdateFunction, OwnerClass));
+		return NodeObj;
+	};
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	TArray<TSharedPtr<FJsonValue>> NodesArr;
+
+	if (!NodeId.IsEmpty())
+	{
+		// Single node — locate it (re-walk graphs to also recover its owning graph).
+		UAnimGraphNode_Base* AnimNode = MonolithAnimNodeBindingHelpers::FindAnimNode(ABP, NodeId, GraphFilter);
+		if (!AnimNode)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Anim node not found: %s"), *NodeId));
+		}
+		NodesArr.Add(MakeShared<FJsonValueObject>(EmitNode(AnimNode, AnimNode->GetGraph())));
+	}
+	else
+	{
+		// All nodes that carry ANY non-empty function binding.
+		TArray<UEdGraph*> AllGraphs;
+		ABP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph) continue;
+			if (!GraphFilter.IsEmpty() && Graph->GetName() != GraphFilter) continue;
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node);
+				if (!AnimNode) continue;
+				if (!MonolithAnimNodeBindingReader::HasAnyFunctionBinding(AnimNode)) continue;
+				NodesArr.Add(MakeShared<FJsonValueObject>(EmitNode(AnimNode, Graph)));
+			}
+		}
+	}
+
+	Root->SetArrayField(TEXT("nodes"), NodesArr);
+	Root->SetNumberField(TEXT("count"), NodesArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodeFunctionBinding(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NodeId = Params->GetStringField(TEXT("node_id"));
+	FString Binding = Params->GetStringField(TEXT("binding"));
+	FString FunctionName;
+	Params->TryGetStringField(TEXT("function_name"), FunctionName);
+	FString FunctionClassPath;
+	Params->TryGetStringField(TEXT("function_class"), FunctionClassPath);
+	FString GraphFilter;
+	Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+	bool bRecompile = true;
+	Params->TryGetBoolField(TEXT("recompile"), bRecompile);
+	bool bAllowNonThreadSafe = false;
+	Params->TryGetBoolField(TEXT("allow_non_thread_safe"), bAllowNonThreadSafe);
+
+	if (Binding != TEXT("initial_update") && Binding != TEXT("become_relevant") && Binding != TEXT("update"))
+	{
+		return FMonolithActionResult::Error(TEXT("binding must be one of: initial_update, become_relevant, update"));
+	}
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimGraphNode_Base* AnimNode = MonolithAnimNodeBindingHelpers::FindAnimNode(ABP, NodeId, GraphFilter);
+	if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(TEXT("Anim node not found: %s"), *NodeId));
+
+	FName PropertyName = NAME_None;
+	FMemberReference* Ref = MonolithAnimNodeBindingHelpers::ResolveFunctionRef(AnimNode, Binding, PropertyName);
+	if (!Ref) return FMonolithActionResult::Error(TEXT("Could not resolve the function-binding member reference"));
+
+	UClass* OwnerClass = ABP->SkeletonGeneratedClass ? ABP->SkeletonGeneratedClass : ABP->GeneratedClass;
+
+	const bool bClearing = FunctionName.IsEmpty();
+
+	ABP->Modify();
+
+	if (bClearing)
+	{
+		// Reset to default (empty) — the validator treats GetMemberName()==NAME_None
+		// as "no binding". SetSelfMember(NAME_None) restores that state.
+		Ref->SetSelfMember(NAME_None);
+	}
+	else
+	{
+		// Resolve the target UFunction. Default: self-member on the AnimBP class.
+		// Optional function_class: an external library class.
+		UClass* FunctionClass = nullptr;
+		if (!FunctionClassPath.IsEmpty())
+		{
+			FunctionClass = FindObject<UClass>(nullptr, *FunctionClassPath);
+			if (!FunctionClass)
+			{
+				FunctionClass = LoadObject<UClass>(nullptr, *FunctionClassPath);
+			}
+			if (!FunctionClass)
+			{
+				return FMonolithActionResult::Error(FString::Printf(TEXT("function_class not found: %s"), *FunctionClassPath));
+			}
+		}
+
+		UClass* ResolveClass = FunctionClass ? FunctionClass : OwnerClass;
+		UFunction* Function = ResolveClass ? ResolveClass->FindFunctionByName(FName(*FunctionName)) : nullptr;
+		if (!Function)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Function '%s' not found on %s"), *FunctionName,
+				ResolveClass ? *ResolveClass->GetName() : TEXT("<null class>")));
+		}
+
+		// --- Validate-before-commit, mirroring UAnimGraphNode_Base::ValidateFunctionRef ---
+		// Prototype signature: read the PrototypeFunction metadata off the node property
+		// and require IsSignatureCompatibleWith (same as the engine validator).
+		if (const FProperty* Property = AnimNode->GetClass()->FindPropertyByName(PropertyName))
+		{
+			const FString& PrototypeFunctionName = Property->GetMetaData(TEXT("PrototypeFunction"));
+			const UFunction* PrototypeFunction = PrototypeFunctionName.IsEmpty()
+				? nullptr : FindObject<UFunction>(nullptr, *PrototypeFunctionName);
+			if (PrototypeFunction && !PrototypeFunction->IsSignatureCompatibleWith(Function))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Function '%s' signature is not compatible with the anim-update prototype (%s)"),
+					*FunctionName, *PrototypeFunctionName));
+			}
+		}
+
+		// Thread-safe gate: HARD REJECT a non-thread-safe function unless explicitly
+		// allowed. Binding a non-thread-safe function to a worker-thread anim-update
+		// slot silently corrupts evaluation — the engine validator errors here too.
+		const bool bThreadSafe = FBlueprintEditorUtils::HasFunctionBlueprintThreadSafeMetaData(Function);
+		if (!bThreadSafe && !bAllowNonThreadSafe)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Function '%s' is not thread-safe; refusing to bind it to an anim-update slot. ")
+				TEXT("Mark it BlueprintThreadSafe or pass allow_non_thread_safe=true to override."),
+				*FunctionName));
+		}
+
+		// Commit the member reference.
+		if (FunctionClass)
+		{
+			Ref->SetExternalMember(FName(*FunctionName), FunctionClass);
+		}
+		else
+		{
+			Ref->SetSelfMember(FName(*FunctionName));
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(ABP);
+
+	bool bCompiled = false;
+	if (bRecompile)
+	{
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+		bCompiled = true;
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_id"), AnimNode->GetName());
+	Root->SetStringField(TEXT("binding"), Binding);
+	Root->SetBoolField(TEXT("cleared"), bClearing);
+	if (!bClearing) Root->SetStringField(TEXT("function_name"), FunctionName);
+	Root->SetBoolField(TEXT("recompiled"), bCompiled);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetAnimNodePinBindings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NodeId;
+	Params->TryGetStringField(TEXT("node_id"), NodeId);
+	FString GraphFilter;
+	Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	auto EmitNode = [](UAnimGraphNode_Base* AnimNode, UEdGraph* Graph) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+		NodeObj->SetStringField(TEXT("node_id"), AnimNode->GetName());
+		NodeObj->SetStringField(TEXT("node_guid"), AnimNode->NodeGuid.ToString());
+		NodeObj->SetStringField(TEXT("class"), AnimNode->GetClass()->GetName());
+		NodeObj->SetStringField(TEXT("title"), AnimNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+		if (Graph) NodeObj->SetStringField(TEXT("graph"), Graph->GetName());
+
+		TArray<TSharedPtr<FJsonValue>> Entries;
+		FString Note;
+		MonolithAnimNodeBindingReader::ReadPinBindings(AnimNode, Entries, Note);
+		NodeObj->SetArrayField(TEXT("pin_bindings"), Entries);
+		if (!Note.IsEmpty()) NodeObj->SetStringField(TEXT("note"), Note);
+		return NodeObj;
+	};
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	TArray<TSharedPtr<FJsonValue>> NodesArr;
+
+	if (!NodeId.IsEmpty())
+	{
+		UAnimGraphNode_Base* AnimNode = MonolithAnimNodeBindingHelpers::FindAnimNode(ABP, NodeId, GraphFilter);
+		if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(TEXT("Anim node not found: %s"), *NodeId));
+		NodesArr.Add(MakeShared<FJsonValueObject>(EmitNode(AnimNode, AnimNode->GetGraph())));
+	}
+	else
+	{
+		// All nodes that carry any pin binding.
+		TArray<UEdGraph*> AllGraphs;
+		ABP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph) continue;
+			if (!GraphFilter.IsEmpty() && Graph->GetName() != GraphFilter) continue;
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node);
+				if (!AnimNode) continue;
+				TArray<TSharedPtr<FJsonValue>> Probe;
+				FString ProbeNote;
+				if (MonolithAnimNodeBindingReader::ReadPinBindings(AnimNode, Probe, ProbeNote) > 0)
+				{
+					NodesArr.Add(MakeShared<FJsonValueObject>(EmitNode(AnimNode, Graph)));
+				}
+			}
+		}
+	}
+
+	Root->SetArrayField(TEXT("nodes"), NodesArr);
+	Root->SetNumberField(TEXT("count"), NodesArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NodeId = Params->GetStringField(TEXT("node_id"));
+	FString Pin = Params->GetStringField(TEXT("pin"));
+	FString GraphFilter;
+	Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+	bool bRecompile = true;
+	Params->TryGetBoolField(TEXT("recompile"), bRecompile);
+
+	// path: string array (empty/null clears by removing the pin's map entry).
+	TArray<FString> Path;
+	const TArray<TSharedPtr<FJsonValue>>* PathArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("path"), PathArr) && PathArr)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *PathArr)
+		{
+			FString Seg;
+			if (V.IsValid() && V->TryGetString(Seg)) Path.Add(Seg);
+		}
+	}
+	const bool bClearing = (Path.Num() == 0);
+
+	if (Pin.IsEmpty()) return FMonolithActionResult::Error(TEXT("pin (PropertyName) is required"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimGraphNode_Base* AnimNode = MonolithAnimNodeBindingHelpers::FindAnimNode(ABP, NodeId, GraphFilter);
+	if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(TEXT("Anim node not found: %s"), *NodeId));
+
+	const FName PinName(*Pin);
+	ABP->Modify();
+
+	// The node's binding object is type UAnimGraphNodeBinding, which is only
+	// forward-declared in reachable headers (defining header in AnimGraph/Internal/).
+	// We MUST treat it as a plain UObject* end-to-end — never GetBinding()/
+	// GetMutableBinding() (incomplete return type) and never RemoveBindings() (a virtual
+	// on the incomplete class). Both clear and write run entirely through FScriptMapHelper
+	// on the reflectively-resolved PropertyBindings map.
+	FMapProperty* MapProp = nullptr;
+	void* MapPtr = nullptr;
+	UObject* BindingObj = nullptr;
+	const bool bHasMap = MonolithAnimNodeBindingReader::ResolvePropertyBindingsMap(AnimNode, MapProp, MapPtr, BindingObj);
+
+	if (bClearing)
+	{
+		// Remove the pin's map entry (this is what UAnimGraphNodeBinding_Base::RemoveBindings
+		// does internally). If the node has no binding object / map, there is nothing to
+		// clear — treat as a benign no-op rather than an error.
+		if (bHasMap)
+		{
+			if (BindingObj) BindingObj->Modify();
+			FScriptMapHelper Helper(MapProp, MapPtr);
+			Helper.RemovePair(&PinName); // find-by-key + remove; no-op if absent
+		}
+	}
+	else
+	{
+		// Plan-sanctioned v1 fallback: creating a default binding object reflectively
+		// (NewObject on a class resolved by name) is fragile; require an existing binding
+		// object and return a clear error. A binding object exists once any binding (pin
+		// or via the editor) has been authored on the node.
+		if (!bHasMap)
+		{
+			return FMonolithActionResult::Error(
+				TEXT("This node has no binding object (or no PropertyBindings map). v1 requires an ")
+				TEXT("existing binding - author at least one pin binding in-editor first, then retry."));
+		}
+
+		FStructProperty* ValueStructProp = CastField<FStructProperty>(MapProp->ValueProp);
+		if (!ValueStructProp || ValueStructProp->Struct != FAnimGraphNodePropertyBinding::StaticStruct())
+		{
+			return FMonolithActionResult::Error(TEXT("PropertyBindings value type is not FAnimGraphNodePropertyBinding"));
+		}
+		FNameProperty* KeyProp = CastField<FNameProperty>(MapProp->KeyProp);
+		if (!KeyProp)
+		{
+			return FMonolithActionResult::Error(TEXT("PropertyBindings key type is not FName"));
+		}
+
+		// Build the binding value. Mirrors AnimGraphNodeBinding_Base.cpp:486-499.
+		// NOTE: RecalculateBindingType (which derives PinType/PromotedPinType from the
+		// property path) is a PRIVATE static and unreachable. We DO NOT set PinType here;
+		// instead we trigger re-derivation via ReconstructNode() below — see the
+		// re-derive comment. PathAsText is a display field; set it to the dotted path so
+		// the binding reads cleanly even before the reconstruct refreshes it.
+		FAnimGraphNodePropertyBinding NewBinding;
+		NewBinding.PropertyName = PinName;
+		NewBinding.PropertyPath = Path;
+		NewBinding.PathAsText = FText::FromString(FString::Join(Path, TEXT(".")));
+		NewBinding.Type = EAnimGraphNodePropertyBindingType::Property;
+		NewBinding.bIsBound = true;
+
+		if (BindingObj) BindingObj->Modify();
+
+		// AddPair overwrites an existing entry for the same key (engine PropertyBindings.Add
+		// semantics) and rehashes internally — no manual pre-remove / Rehash needed.
+		FScriptMapHelper Helper(MapProp, MapPtr);
+		Helper.AddPair(&PinName, &NewBinding);
+	}
+
+	// --- Re-derive trigger (the plan's CRITICAL OPEN DETAIL) ---
+	// Verified in engine source: the binding-type re-derivation lives in
+	// UAnimGraphNodeBinding_Base::RecalculateBindingType (private/static, unreachable).
+	// It is invoked by UAnimGraphNodeBinding_Base::OnReconstructNode, which loops over
+	// every entry in PropertyBindings (AnimGraphNodeBinding_Base.cpp:80-90). That
+	// override fires from the engine's own write path via AnimGraphNode->ReconstructNode()
+	// (AnimGraphNodeBinding_Base.cpp:503). UEdGraphNode::ReconstructNode() is PUBLIC
+	// (EdGraphNode.h:711), so we call it directly to re-derive PinType/PromotedPinType
+	// before compiling. CompileBlueprint alone is NOT relied upon for the re-derive.
+	AnimNode->ReconstructNode();
+	FBlueprintEditorUtils::MarkBlueprintAsModified(ABP);
+
+	bool bCompiled = false;
+	if (bRecompile)
+	{
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+		bCompiled = true;
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_id"), AnimNode->GetName());
+	Root->SetStringField(TEXT("pin"), Pin);
+	Root->SetBoolField(TEXT("cleared"), bClearing);
+	if (!bClearing)
+	{
+		TArray<TSharedPtr<FJsonValue>> PathOut;
+		for (const FString& Seg : Path) PathOut.Add(MakeShared<FJsonValueString>(Seg));
+		Root->SetArrayField(TEXT("path"), PathOut);
+	}
+	Root->SetBoolField(TEXT("recompiled"), bCompiled);
 	return FMonolithActionResult::Success(Root);
 }

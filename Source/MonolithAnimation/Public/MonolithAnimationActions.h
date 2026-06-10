@@ -195,6 +195,17 @@ public:
 	static FMonolithActionResult HandleRemoveSyncMarker(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRenameSyncMarker(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Anim-node bindings: function (Gap 2) + pin property (Gap 12) ---
+	// Function bindings live on UAnimGraphNode_Base's public FMemberReference
+	// UPROPERTYs (InitialUpdate/BecomeRelevant/Update Function). Pin property
+	// bindings live in the node's UAnimGraphNodeBinding_Base::PropertyBindings map
+	// (unlinkable class — reached via FProperty reflection). Setters mirror the
+	// engine's own validate-then-recompile handshake.
+	static FMonolithActionResult HandleGetAnimNodeFunctionBindings(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetAnimNodeFunctionBinding(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetAnimNodePinBindings(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetAnimNodePinBinding(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Wave 13: Batch Ops + Montage Completion (6) ---
 	static FMonolithActionResult HandleBatchExecute(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddMontageAnimSegment(const TSharedPtr<FJsonObject>& Params);
