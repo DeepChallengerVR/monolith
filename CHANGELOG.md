@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-13
+
+An LLM-C++-ergonomics release: an eight-action `source` pack so your AI can resolve an include, signature, deprecation, Build.cs deps, header lint, or a UCLASS stub in one round-trip, plus a parser fix that tripled the engine source index. Layered on top: live-PIE introspection + driving (`editor`), anim-node binding read/write and time-series PIE sampling (`animation`), Blueprint variable census + contract reconciliation (`blueprint`), and T3D asset-text export (`project`). Two first-launch crash/load fixes (issue #70, thanks @aggitti) and a ~40% smaller `tools/list` manifest round it out.
+
+> **Action count is approximate.** As of this release Monolith exposes **~1,400+ actions across 25+ in-tree namespaces** (public, in-tree only). Query `monolith_discover()` (its `total_actions` field) for the exact live figure at any moment — docs are kept in the right ballpark, not pinned to an integer.
+
+> **⚠️ Re-run a full engine source index after upgrading.** This release's index gains only populate after one full `source.trigger_reindex` (the editor's "Reindex Engine Source" / `monolith_reindex`): the ~3x larger engine symbol table from allman-brace class/struct indexing (`symbols` rows `301,590 → 967,491`), the new deprecation index (`EngineSource.db` schema v2), and the `build_cs_path` backfill. Existing `EngineSource.db` files enrich on the next full pass — a project-only reindex does NOT cover engine symbols. Until you reindex, the new `source` ergonomics actions (`get_signature`, `verify_symbols`, `check_deprecations`, `find_example_usage`, `get_include_path`, …) operate against the old, smaller table and `check_deprecations` returns `index_state: "empty"`.
+
 ### Added
 
 - **LLM C++ authoring ergonomics — Phase 1 (`source`).** Three demand-proven lookups so an agent can resolve an include, a signature, or a deprecation status in one round-trip without reading raw source. All read-only / idempotent and offline-served by `monolith_query.exe` / `monolith_offline.py`.
