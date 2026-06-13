@@ -559,14 +559,19 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJ
 			FString ToolName = FString::Printf(TEXT("%s_query"), *Namespace);
 			Tool->SetStringField(TEXT("name"), ToolName);
 
-			// Build description with action list
-			FString Description = FString::Printf(TEXT("Query the %s domain. Available actions: "), *Namespace);
+			// Action names still drive the `action` enum below (authoritative value
+			// constraint). The full list is NOT duplicated into the description prose —
+			// that copy was ~32k chars (~41% of the tools/list manifest). Clients fetch
+			// the list on demand via monolith_discover("<namespace>").
 			TArray<FString> ActionNames;
 			for (const FMonolithActionInfo& ActionInfo : Actions)
 			{
 				ActionNames.Add(ActionInfo.Action);
 			}
-			Description += FString::Join(ActionNames, TEXT(", "));
+
+			const FString Description = FString::Printf(
+				TEXT("Query the %s domain. Call monolith_discover(\"%s\") for the action list."),
+				*Namespace, *Namespace);
 			Tool->SetStringField(TEXT("description"), Description);
 
 			// Build input schema
