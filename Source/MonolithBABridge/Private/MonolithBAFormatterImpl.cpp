@@ -45,7 +45,7 @@ bool FMonolithBAFormatterImpl::FormatGraph(
 	}
 
 	// 2. Check if BA is still caching node sizes
-	if (Handler->IsCalculatingNodeSize())
+	if (Handler->GetNumberOfPendingNodesToCache() > 0)
 	{
 		OutErrorMessage = TEXT("Blueprint Assist is still caching node sizes. "
 			"Try again in a moment.");
@@ -61,20 +61,9 @@ bool FMonolithBAFormatterImpl::FormatGraph(
 		return false;
 	}
 
-	// 4. Dispatch formatting
-	// FormatAllEvents() and SimpleFormatAll() create their own FScopedTransaction
-	// -- do NOT wrap in another transaction.
-	FBAFormatterSettings* Settings = UBASettings::FindFormatterSettings(Graph);
-	if (!Settings || FBAUtils::IsBlueprintGraph(Graph))
-	{
-		// Multi-root Blueprint graphs use FormatAllEvents
-		Handler->FormatAllEvents();
-	}
-	else
-	{
-		// Simple/BT formatter
-		Handler->SimpleFormatAll();
-	}
+	// 4. Dispatch formatting through BA's public graph-handler API. Current BA
+	// versions route both Blueprint and simple graph formatting through this call.
+	Handler->RequestFormatAll();
 
 	// 5. Report node count
 	OutNodesFormatted = Graph->Nodes.Num();
