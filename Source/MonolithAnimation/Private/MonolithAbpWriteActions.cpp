@@ -31,6 +31,10 @@
 #include "AnimGraphNode_UseCachedPose.h"
 // AnimGraph authoring (Group 2) — blend-by-int dynamic pins, layered-bone-blend layer setup.
 #include "AnimGraphNode_BlendListByInt.h"
+// add_blend_by_enum — the BlendListByEnum editor node. Its inner FAnimNode_BlendListByEnum (public
+// Node UPROPERTY) exposes the header-inline FAnimNode_BlendListBase::AddPose(); BoundEnum /
+// VisibleEnumEntries are protected UPROPERTYs written by reflection.
+#include "AnimGraphNode_BlendListByEnum.h"
 // AnimGraph authoring (Group 3) — Control Rig anim node + linked anim layer.
 // FAnimNode_ControlRig::ControlRigClass is a private EditAnywhere UPROPERTY — written via the inner
 // ImportTextOntoStruct path (the unexported SetControlRigClass / MinimalAPI LinkedAnimLayer setters are
@@ -339,6 +343,20 @@ void FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
 			.Required(TEXT("num_poses"), TEXT("number"), TEXT("Total number of blend-pose input pins (2..32)"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target graph name (default: AnimGraph)"), TEXT("AnimGraph"))
+			.Optional(TEXT("state_name"), TEXT("string"), TEXT("State name — place inside this state's inner graph"))
+			.Optional(TEXT("position_x"), TEXT("number"), TEXT("Node X position (default: 200)"), TEXT("200"))
+			.Optional(TEXT("position_y"), TEXT("number"), TEXT("Node Y position (default: 0)"), TEXT("0"))
+			.Build());
+
+	// --- add_blend_by_enum (AnimGraph authoring, Group 2) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_blend_by_enum"),
+		TEXT("Place a Blend Poses by enum node (UAnimGraphNode_BlendListByEnum) bound to the enum at enum_path, with one BlendPose_* input pin exposed per chosen enumerator plus the always-present index-0 'Default' pin (which catches every enum value not given its own pin). By default every non-Hidden, non-_MAX enumerator is exposed; pass 'enumerators' to expose an explicit subset. The active enum value selects which pose plays; wire each exposed BlendPose pin to a candidate pose afterward."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleAddBlendByEnum),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("enum_path"), TEXT("string"), TEXT("UEnum object path or name to bind (e.g. /Game/Enums/E_Locomotion.E_Locomotion, or a C++ enum like EAnimGroupRole)"))
+			.Optional(TEXT("enumerators"), TEXT("array"), TEXT("Explicit subset of enumerator names to expose as pins (default: all non-Hidden, non-_MAX enumerators). Names may be short (e.g. 'Walk') or fully-qualified (e.g. 'E_Locomotion::Walk')."))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target graph name (default: AnimGraph)"), TEXT("AnimGraph"))
 			.Optional(TEXT("state_name"), TEXT("string"), TEXT("State name — place inside this state's inner graph"))
 			.Optional(TEXT("position_x"), TEXT("number"), TEXT("Node X position (default: 200)"), TEXT("200"))
@@ -3087,6 +3105,284 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleAddBlendByInt(const TShare
 	Root->SetStringField(TEXT("node_name"), NewNode->GetName());
 	Root->SetNumberField(TEXT("requested_poses"), NumPoses);
 	Root->SetNumberField(TEXT("blend_pose_pins"), PoseInputPins);
+	Root->SetArrayField(TEXT("pins"), BuildPinList(NewNode));
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: add_blend_by_enum (Group 2)
+//
+// Place a UAnimGraphNode_BlendListByEnum bound to a UEnum, exposing one pose pin per
+// chosen enumerator (plus the always-present index-0 "Default" pin). The editor node's
+// own pin-grow primitives are out of reach across the module boundary:
+//   - ExposeEnumElementAsPin(FName) is protected (AnimGraphNode_BlendListByEnum.h:60-61),
+//   - there is NO AddPinToBlendList on the enum node or the base (that exists only on the
+//     Int node), and the class is UCLASS(MinimalAPI).
+// So ExposeEnumElementAsPin is replicated externally (it does exactly: VisibleEnumEntries.Add +
+// Node.AddPose() + ReconstructNode(), AnimGraphNode_BlendListByEnum.cpp:143-158):
+//   - BoundEnum (protected UPROPERTY TObjectPtr<UEnum>, h:25-26) is reflection-set via
+//     FObjectPropertyBase::SetObjectPropertyValue_InContainer (same idiom as :2186-2190).
+//   - VisibleEnumEntries (protected UPROPERTY TArray<FName>, h:28-29) has an FNameProperty inner
+//     DIRECTLY (a scalar array, NOT a struct array), so each enumerator name is appended via
+//     FScriptArrayHelper + FNameProperty::SetPropertyValue on the raw slot.
+//   - the inner FAnimNode_BlendListByEnum Node (public UPROPERTY, h:20-21) exposes the public
+//     header-inline FAnimNode_BlendListBase::AddPose() (#if WITH_EDITOR, AnimNode_BlendListBase.h:
+//     115-119) — inline, so no exported symbol is named.
+// The enum names stored in VisibleEnumEntries use UEnum::GetNameByIndex(i) (the stored Names key),
+// which BakeDataDuringCompilation round-trips through BoundEnum->GetIndexByName() (…ByEnum.cpp:
+// 317-348) to build EnumToPoseIndex automatically — no manual EnumToPoseIndex write. Unexposed enum
+// values fall through to the Default pose (index 0).
+//
+// The node ships with exactly ONE pose pin (its ctor calls Node.AddPose() once → the index-0
+// Default pin). UNLIKE blend-by-int (StartingPoses=2), we do NOT pre-count starting poses; each
+// exposed enumerator adds one AddPose() on top of the ctor's Default. After the loop a single
+// ReconstructNode() materializes the BlendPose_k pins; then the SAME orphan-BlendTime strip +
+// recompile tail that add_blend_by_int ships settles the FoldProperty orphan pins.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// Local duplicate of MonolithReflectionWalker.cpp's IsAutoMaxSentinel (lives in an anonymous
+// namespace in MonolithCore; duplicated here to avoid a cross-module surface change for one
+// 6-line predicate). Skip a given enum index ONLY if it is genuinely the auto-generated _MAX
+// sentinel: the enum reports an existing max (UEnum::ContainsExistingMax()) AND the name ends in
+// "_MAX". The naive "NumEnums()-1" drops the last REAL enumerator on enums with no sentinel
+// (typical of UserDefinedEnums); the conditional form never does.
+bool IsAutoMaxSentinelEntry(const UEnum* Enum, int32 Index)
+{
+	if (!Enum)
+	{
+		return false;
+	}
+	if (!Enum->ContainsExistingMax())
+	{
+		return false;
+	}
+	return Enum->GetNameStringByIndex(Index).EndsWith(TEXT("_MAX"), ESearchCase::CaseSensitive);
+}
+
+} // namespace
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleAddBlendByEnum(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor) return FMonolithActionResult::Error(TEXT("Editor is not available"));
+
+	const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	const FString EnumPath  = Params->HasField(TEXT("enum_path")) ? Params->GetStringField(TEXT("enum_path")) : TEXT("");
+	const FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : TEXT("AnimGraph");
+	const FString StateName = Params->HasField(TEXT("state_name")) ? Params->GetStringField(TEXT("state_name")) : TEXT("");
+
+	if (EnumPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: enum_path"));
+	}
+
+	double TempVal;
+	float PosX = 200.f, PosY = 0.f;
+	if (Params->TryGetNumberField(TEXT("position_x"), TempVal)) PosX = static_cast<float>(TempVal);
+	if (Params->TryGetNumberField(TEXT("position_y"), TempVal)) PosY = static_cast<float>(TempVal);
+
+	// --- Resolve the UEnum (try a full object load first, then a global object lookup by name). ---
+	UEnum* Enum = LoadObject<UEnum>(nullptr, *EnumPath);
+	if (!Enum)
+	{
+		Enum = FindFirstObject<UEnum>(*EnumPath, EFindFirstObjectOptions::NativeFirst);
+	}
+	if (!Enum)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Could not resolve enum_path '%s' to a UEnum. Pass a full object path (e.g. /Game/Enums/E_X.E_X) or a C++ enum name (e.g. EAnimGroupRole)."),
+			*EnumPath));
+	}
+
+	// --- Build the default exposable-enumerator list (non-Hidden, non-_MAX), index-ordered. ---
+	TArray<FName>   AvailableNames;     // stored Names key form (what BakeDataDuringCompilation expects)
+	TArray<FString> AvailableShortStr;  // short, lower-cost match form for the caller's filter
+	const int32 NumEntries = Enum->NumEnums();
+	for (int32 i = 0; i < NumEntries; ++i)
+	{
+		if (IsAutoMaxSentinelEntry(Enum, i))
+		{
+			continue;
+		}
+#if WITH_METADATA
+		if (Enum->HasMetaData(TEXT("Hidden"), i))
+		{
+			continue;
+		}
+#endif
+		AvailableNames.Add(Enum->GetNameByIndex(i));
+		AvailableShortStr.Add(Enum->GetNameStringByIndex(i));
+	}
+
+	if (AvailableNames.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Enum '%s' has no exposable enumerators (all entries are Hidden or the _MAX sentinel)."), *Enum->GetName()));
+	}
+
+	// --- Resolve the chosen enumerators (optional explicit subset; default = all available). ---
+	// Match a requested name against either the full stored key (E::Walk) or the short name (Walk),
+	// case-insensitively, mirroring UEnum::GetIndexByName's lenient resolution. De-dupe, preserving
+	// the requested order; error on any unknown name with the valid list.
+	TArray<FName> ChosenNames;
+	if (Params->HasField(TEXT("enumerators")))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* RawList = nullptr;
+		if (!Params->TryGetArrayField(TEXT("enumerators"), RawList) || !RawList)
+		{
+			return FMonolithActionResult::Error(TEXT("Parameter 'enumerators' must be an array of enumerator name strings"));
+		}
+
+		for (const TSharedPtr<FJsonValue>& Val : *RawList)
+		{
+			FString Requested;
+			if (!Val.IsValid() || !Val->TryGetString(Requested) || Requested.IsEmpty())
+			{
+				continue;
+			}
+
+			int32 MatchIdx = INDEX_NONE;
+			for (int32 k = 0; k < AvailableNames.Num(); ++k)
+			{
+				if (AvailableNames[k].ToString().Equals(Requested, ESearchCase::IgnoreCase) ||
+				    AvailableShortStr[k].Equals(Requested, ESearchCase::IgnoreCase))
+				{
+					MatchIdx = k;
+					break;
+				}
+			}
+
+			if (MatchIdx == INDEX_NONE)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Enumerator '%s' is not a valid exposable entry of enum '%s'. Valid: [%s]"),
+					*Requested, *Enum->GetName(), *FString::Join(AvailableShortStr, TEXT(", "))));
+			}
+
+			ChosenNames.AddUnique(AvailableNames[MatchIdx]);
+		}
+
+		if (ChosenNames.Num() == 0)
+		{
+			return FMonolithActionResult::Error(TEXT("Parameter 'enumerators' resolved to no usable enumerator names"));
+		}
+	}
+	else
+	{
+		ChosenNames = AvailableNames;
+	}
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	FString GraphError;
+	UEdGraph* TargetGraph = ResolveTargetGraph(ABP, GraphName, StateName, GraphError);
+	if (!TargetGraph) return FMonolithActionResult::Error(GraphError);
+
+	FString SpawnError;
+	UAnimGraphNode_Base* NewNode = SpawnAndWirePoseInput(
+		TargetGraph, UAnimGraphNode_BlendListByEnum::StaticClass(), PosX, PosY,
+		nullptr, NAME_None, SpawnError);
+	if (!NewNode) return FMonolithActionResult::Error(SpawnError);
+
+	UAnimGraphNode_BlendListByEnum* EnumNode = Cast<UAnimGraphNode_BlendListByEnum>(NewNode);
+	if (!EnumNode) return FMonolithActionResult::Error(TEXT("Spawned node is not a BlendListByEnum node"));
+
+	// --- Reflection-set the protected BoundEnum (TObjectPtr<UEnum>) on the editor node. ---
+	FProperty* BoundEnumProp = EnumNode->GetClass()->FindPropertyByName(TEXT("BoundEnum"));
+	FObjectPropertyBase* BoundEnumObjProp = CastField<FObjectPropertyBase>(BoundEnumProp);
+	if (!BoundEnumObjProp)
+	{
+		return FMonolithActionResult::Error(TEXT("BlendListByEnum node has no FObjectProperty 'BoundEnum' (engine layout changed?)"));
+	}
+
+	// --- Resolve the protected VisibleEnumEntries (TArray<FName>) reflection handles. ---
+	FArrayProperty* VisibleProp = CastField<FArrayProperty>(EnumNode->GetClass()->FindPropertyByName(TEXT("VisibleEnumEntries")));
+	if (!VisibleProp)
+	{
+		return FMonolithActionResult::Error(TEXT("BlendListByEnum node has no array property 'VisibleEnumEntries' (engine layout changed?)"));
+	}
+	FNameProperty* VisibleInnerName = CastField<FNameProperty>(VisibleProp->Inner);
+	if (!VisibleInnerName)
+	{
+		return FMonolithActionResult::Error(TEXT("'VisibleEnumEntries' inner is not an FNameProperty (engine layout changed?)"));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Blend By Enum")));
+	EnumNode->Modify();
+
+	BoundEnumObjProp->SetObjectPropertyValue_InContainer(EnumNode, Enum);
+
+	// Append each chosen enumerator name to VisibleEnumEntries (scalar FName array — the raw slot
+	// IS the FName, no struct-inner step) and grow the inner pose array by one Default per entry.
+	void* VisibleArrayPtr = VisibleProp->ContainerPtrToValuePtr<void>(EnumNode);
+	FScriptArrayHelper VisibleHelper(VisibleProp, VisibleArrayPtr);
+	for (const FName& EnumeratorName : ChosenNames)
+	{
+		const int32 Idx = VisibleHelper.AddValue();
+		VisibleInnerName->SetPropertyValue(VisibleHelper.GetRawPtr(Idx), EnumeratorName);
+
+		// Public header-inline AddPose() (FAnimNode_BlendListBase) — grows BlendPose + BlendTime.
+		EnumNode->Node.AddPose();
+	}
+
+	EnumNode->ReconstructNode();
+
+	GEditor->EndTransaction();
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+
+	// Orphan-pin strip — identical to add_blend_by_int. Each Node.AddPose() grows the FoldProperty
+	// BlendTime array (value 0.1f); during the intermediate grows an unmatched BlendTime_k pin is
+	// retained as an orphan by RewireOldPinsToNewPins until CompileBlueprint reconciles the fold
+	// state. The orphans have no links — remove them directly (collect first, then remove, so Pins
+	// is not mutated mid-iteration), then recompile to clear the orphan-pin warning.
+	TArray<UEdGraphPin*> OrphanPins;
+	for (UEdGraphPin* Pin : EnumNode->Pins)
+	{
+		if (Pin && Pin->bOrphanedPin)
+		{
+			OrphanPins.Add(Pin);
+		}
+	}
+	for (UEdGraphPin* Pin : OrphanPins)
+	{
+		EnumNode->RemovePin(Pin);
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+
+	ABP->MarkPackageDirty();
+
+	// Count the realized BlendPose_* input pins (1 Default + N exposed enumerators).
+	int32 PoseInputPins = 0;
+	for (UEdGraphPin* Pin : EnumNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Input && Pin->PinName.ToString().StartsWith(TEXT("BlendPose")))
+		{
+			++PoseInputPins;
+		}
+	}
+
+	// Echo the enumerator names actually exposed (short form) for caller readback / wiring.
+	TArray<TSharedPtr<FJsonValue>> ExposedJson;
+	for (const FName& Name : ChosenNames)
+	{
+		ExposedJson.Add(MakeShared<FJsonValueString>(Name.ToString()));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_name"), NewNode->GetName());
+	Root->SetStringField(TEXT("enum_path"), EnumPath);
+	Root->SetStringField(TEXT("bound_enum"), Enum->GetName());
+	Root->SetNumberField(TEXT("pose_pins"), PoseInputPins);
+	Root->SetNumberField(TEXT("exposed_enumerators"), ChosenNames.Num());
+	Root->SetArrayField(TEXT("enumerators"), ExposedJson);
 	Root->SetArrayField(TEXT("pins"), BuildPinList(NewNode));
 	Root->SetBoolField(TEXT("saved"), false);
 	return FMonolithActionResult::Success(Root);

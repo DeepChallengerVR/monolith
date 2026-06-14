@@ -59,12 +59,20 @@ private:
 	//   (UAnimStateNode::GetPoseSinkPinInsideState).
 	// add_blend_by_int          : UAnimGraphNode_BlendListByInt grown to num_poses pose pins via
 	//   the ANIMGRAPH_API AddPinToBlendList().
+	// add_blend_by_enum         : UAnimGraphNode_BlendListByEnum bound to an enum, with one pose pin
+	//   exposed per chosen enumerator (plus the always-present index-0 Default pin). The editor node's
+	//   ExposeEnumElementAsPin / AddPinToBlendList are protected/Int-only, so the same effect is
+	//   replicated externally: reflection-set the protected BoundEnum + reflection-Add each enumerator
+	//   FName into the protected VisibleEnumEntries (TArray<FName>), and call the public header-inline
+	//   inner Node.AddPose() per entry, then ReconstructNode(). BakeDataDuringCompilation auto-builds
+	//   EnumToPoseIndex from VisibleEnumEntries; unexposed values fall through to Default (pose 0).
 	// set_sync_group            : write GroupName/GroupRole/Method on an asset-player node via the
 	//   inner FAnimNode_SequencePlayer/BlendSpacePlayer ENGINE_API setters (NOT FoldProperty reflection).
 	// set_layered_blend_bones   : grow UAnimGraphNode_LayeredBoneBlend pins (AddPinToBlendByFilter)
 	//   then write each layer's FBranchFilter{BoneName,BlendDepth} into the editfixedsize LayerSetup.
 	static FMonolithActionResult HandleSetStateResultSource(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddBlendByInt(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddBlendByEnum(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetSyncGroup(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetLayeredBlendBones(const TSharedPtr<FJsonObject>& Params);
 
