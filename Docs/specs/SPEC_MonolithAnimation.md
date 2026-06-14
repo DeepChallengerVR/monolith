@@ -197,6 +197,18 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `build_motion_matching_node` | Composite: spawn + wire + configure a Motion-Matching node (with its Pose-History) in one call. As of 2026-06-07 also wires the Pose-History pose-out to the AnimGraph Output Pose (`UAnimGraphNode_Root` 'Result' input) and reports `output_pose_wired`. |
 | `get_anim_graph_output_connection` | READ-ONLY: report whether the AnimGraph's Output Pose (`UAnimGraphNode_Root` 'Result' input) is driven, and by which `source_node`/`source_pin`. Optional `graph_name` (default the main AnimGraph). |
 
+**IK Rig (5 — Wave 8a)** — namespace `animation`. Read an IK Rig / IK Retargeter asset, add and remove solvers on the rig's solver stack, and map retarget chains. (Solver-stack edits operate on an existing asset; see the Retarget create/run pack below for asset creation.)
+
+| Action | Description |
+|--------|-------------|
+| `get_ikrig_info` | Get IK Rig asset info: solvers, goals, retarget chains, and skeleton overview. Read-only. |
+| `add_ik_solver` | Add a solver to an IK Rig's solver stack, optionally setting a `root_bone` and `goals`. `solver_type` is resolved against the **live solver-struct table** (every native `FIKRigSolverBase` child), not a hardcoded reflected path: a friendly alias (`fullbodyik`/`fbik`, `limb`, `pole`, `bodymover`, `settransform`, `stretchlimb`, plus the `…solver`-suffixed spellings) maps to a canonical struct name, then resolution proceeds exact struct-name match (the leading-`F` C++ spelling is also accepted) → unique-substring fallback. An ambiguous input returns an error listing the candidate solvers; an unknown input returns the full available-solver list. The resolved `UScriptStruct*` is passed to the engine `UIKRigController::AddSolver`. `root_bone` sets the solver's start bone (meaningful for solvers that use one, e.g. Full Body IK). Returns the new `solver_index`, the resolved `solver_type`, the solver `label`, and `created_goals` / `skipped_goals`. |
+| `remove_ik_solver` | Remove a solver from the stack by index. Params: `asset_path` (required), `solver_index` (required int, 0-based). Validates the index against the current solver count and returns a clear out-of-range error when it falls outside `0..count-1`. Returns `removed_index` and `solver_count_after`. |
+| `get_retargeter_info` | Get IK Retargeter asset info: source/target rigs, preview meshes, and chain mappings. Read-only. |
+| `set_retarget_chain_mapping` | Set chain mappings on an IK Retargeter via auto-map (`exact` / `fuzzy` / `clear`) or a manual `source_chain` / `target_chain` pair. |
+
+> **`add_ik_solver` solver resolution (this release).** The old path passed a hardcoded reflected struct path (`/Script/IKRig.FullBodyIKSolver`) that does not resolve in UE 5.7, so adding solvers — Full Body IK especially — failed. Solver resolution now enumerates the live `FIKRigSolverBase` struct table and matches `solver_type` deterministically (alias → exact struct name → unique-substring), so it tracks whatever solver structs the running engine registers. See Fixes below.
+
 **Retarget create/run pack (4 — 2026-06-07)** — namespace `animation`. Create the IK Rig / IK Retargeter assets and run a batch retarget, so a source skeleton's animation library can be re-authored onto a target skeleton.
 
 | Action | Description |
@@ -222,6 +234,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 - `get_database_stats` — fixed a pre-existing crash that asserted on a PoseSearch database with no built search index (unbuilt database). Now returns stats / a clear state instead of asserting.
 - `build_motion_matching_node` — now wires the Pose-History chain through to the AnimGraph Output Pose (`UAnimGraphNode_Root` 'Result' input); previously the composite spawned and configured the node but left it disconnected from the output, so it never drove the final pose.
 - `batch_retarget_animations` — no longer produces frozen (pass-through) output clips. The default retarget op stack is now seeded on the retargeter (see Retarget pack above), so retargeted sequences carry actual remapped motion.
+- `add_ik_solver` — fixed solver resolution that used a hardcoded reflected struct path (`/Script/IKRig.FullBodyIKSolver`) which does not resolve in UE 5.7, so adding solvers (Full Body IK in particular) failed. `solver_type` now resolves against the live `FIKRigSolverBase` struct table via alias → exact struct name → unique-substring (see the IK Rig section above).
 
 **ControlRig Write (3)**
 | Action | Description |

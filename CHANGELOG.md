@@ -17,9 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `set_anim_entry_state` — re-point a state machine's Entry node at an existing state. Params: `asset_path`, `machine_name`, `state_name`. Returns the previous entry target, and reports `unchanged` when the named state is already the entry.
   - `remove_anim_transition` — remove the transition from one state to another. Params: `asset_path`, `machine_name`, `from_state`, `to_state`. Reports how many matching transitions were removed.
 
+- **Remove an IK Rig solver (`animation`).** `remove_ik_solver` removes a solver from an IK Rig's solver stack by index. Params: `asset_path`, `solver_index` (0-based). Validates the index against the current solver count — an out-of-range index returns a clear error naming the valid range — and reports `removed_index` and `solver_count_after`.
+
 ### Fixed
 
 - **MCP-authored blend spaces played bind/A-pose at runtime (`animation`).** The four blend space mutators — `add_blendspace_sample`, `edit_blendspace_sample`, `delete_blendspace_sample`, `set_blend_space_axis` — mutated samples without rebuilding the triangulation (`FBlendSpaceData`), so a blend space authored over MCP shipped with empty triangulation and evaluated to the bind/reference pose at runtime. The asset-editor preview recomputed the triangulation live, which masked the problem in-editor. Each of the four actions now calls `ResampleData()` after the edit and marks the package dirty, so every sample/axis change re-bakes correctly. Existing broken blend spaces can be repaired in place with the new `bake_blend_space` action.
+
+- **`add_ik_solver` failed to add solvers, Full Body IK especially (`animation`).** The action resolved the solver type through a hardcoded reflected struct path (`/Script/IKRig.FullBodyIKSolver`) that does not resolve in UE 5.7, so the add silently failed. `solver_type` is now resolved against the live solver-struct table the engine registers — a friendly alias (`fullbodyik`/`fbik`, `limb`, `pole`, `bodymover`, `settransform`, `stretchlimb`) or the exact struct name, falling back to a unique substring; an ambiguous value returns the candidate solvers and an unknown value returns the available list. Solvers, including Full Body IK, now add correctly.
 
 ## [0.19.0] - 2026-06-13
 

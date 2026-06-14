@@ -122,9 +122,10 @@ public:
 	static FMonolithActionResult HandleAddCompositeSegment(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveCompositeSegment(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Wave 8a: IKRig (4) ---
+	// --- Wave 8a: IKRig (5) ---
 	static FMonolithActionResult HandleGetIKRigInfo(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddIKSolver(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveIKSolver(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetRetargeterInfo(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetRetargetChainMapping(const TSharedPtr<FJsonObject>& Params);
 

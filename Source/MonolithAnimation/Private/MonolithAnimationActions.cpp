@@ -40,7 +40,9 @@
 #include "AnimationModifier.h"
 #include "Rig/IKRigDefinition.h"
 #include "Rig/IKRigSkeleton.h"
+#include "Rig/Solvers/IKRigSolverBase.h" // FIKRigSolverBase::StaticStruct() for add_ik_solver struct enumeration
 #include "RigEditor/IKRigController.h"
+#include "UObject/UObjectIterator.h"     // TObjectIterator<UStruct> — enumerate live IKRig solver-struct table
 #include "Retargeter/IKRetargeter.h"
 #include "Retargeter/IKRetargetChainMapping.h"
 #include "RetargetEditor/IKRetargeterController.h"
@@ -768,9 +770,16 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleAddIKSolver),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("IKRig asset path"))
-			.Required(TEXT("solver_type"), TEXT("string"), TEXT("Solver type (e.g. FullBodyIKSolver or /Script/IKRig.FullBodyIKSolver)"))
-			.Optional(TEXT("root_bone"), TEXT("string"), TEXT("Root bone name for the solver"))
+			.Required(TEXT("solver_type"), TEXT("string"), TEXT("Solver type — friendly alias (fullbodyik/fbik, limb, pole, bodymover, settransform, stretchlimb) or the exact reflected struct name (e.g. IKRigFullBodyIKSolver). Resolved against the live solver-struct table; an unknown value returns the available list."))
+			.Optional(TEXT("root_bone"), TEXT("string"), TEXT("Root/start bone for the solver (meaningful for solvers that use a start bone, e.g. FullBodyIK)"))
 			.Optional(TEXT("goals"), TEXT("array"), TEXT("Array of {name, bone} goal objects to create and connect"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_ik_solver"),
+		TEXT("Remove a solver from an IK Rig asset by stack index"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveIKSolver),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("IKRig asset path"))
+			.Required(TEXT("solver_index"), TEXT("integer"), TEXT("Index of the solver to remove (0-based stack index)"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("get_retargeter_info"),
 		TEXT("Get IK Retargeter asset info: source/target rigs, preview meshes, and chain mappings"),
@@ -5087,17 +5096,92 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddIKSolver(const TShared
 	UIKRigController* C = UIKRigController::GetController(Asset);
 	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
 
-	// Normalize solver type — add package prefix if bare name
-	if (!SolverType.Contains(TEXT("/")))
+	if (SolverType.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("solver_type is required"));
+
+	// Resolve the solver type by enumerating the live FIKRigSolverBase struct table
+	// (engine pattern: IKRigEditorController.cpp:854-882). The struct table is the source of
+	// truth — never a hardcoded /Script/... path. The alias map is a friendly-name convenience
+	// ON TOP of the enumeration; it carries both the bare spelling and the '...solver'-suffixed
+	// spelling so solver_type:"FullBodyIKSolver" resolves via alias before the gated substring
+	// branch is ever reached.
+	static const TMap<FString, FString> Aliases = {       // friendly (lowercase) -> canonical Struct->GetName()
+		{TEXT("fullbodyik"),        TEXT("IKRigFullBodyIKSolver")},
+		{TEXT("fbik"),              TEXT("IKRigFullBodyIKSolver")},
+		{TEXT("fullbodyiksolver"),  TEXT("IKRigFullBodyIKSolver")},
+		{TEXT("limb"),              TEXT("IKRigLimbSolver")},
+		{TEXT("limbsolver"),        TEXT("IKRigLimbSolver")},
+		{TEXT("pole"),              TEXT("IKRigPoleSolver")},
+		{TEXT("polesolver"),        TEXT("IKRigPoleSolver")},
+		{TEXT("bodymover"),         TEXT("IKRigBodyMoverSolver")},
+		{TEXT("bodymoversolver"),   TEXT("IKRigBodyMoverSolver")},
+		{TEXT("settransform"),      TEXT("IKRigSetTransform")},
+		{TEXT("stretchlimb"),       TEXT("IKRigStretchLimbSolver")},
+		{TEXT("stretchlimbsolver"), TEXT("IKRigStretchLimbSolver")},
+	};
+	const FString LowerType = SolverType.ToLower();
+	const FString Want = Aliases.Contains(LowerType) ? Aliases[LowerType] : SolverType;
+
+	// First pass: collect every candidate struct + remember any exact identity-style match.
+	// NEVER break on a substring hit — TObjectIterator order is not stable, and e.g. both
+	// IKRigLimbSolver and IKRigStretchLimbSolver contain "LimbSolver", so a first-hit substring
+	// match is non-deterministic. The engine matches by struct identity, so we resolve
+	// deterministically: alias/exact/prefix first, gated-unique substring only as a last resort.
+	UScriptStruct* Exact = nullptr;
+	TArray<UScriptStruct*> SubstringMatches;
+	TArray<FString> Available;
+	for (TObjectIterator<UStruct> It; It; ++It)
 	{
-		SolverType = FString::Printf(TEXT("/Script/IKRig.%s"), *SolverType);
+		UScriptStruct* S = Cast<UScriptStruct>(*It);
+		if (!S || !S->IsNative() || !S->IsChildOf(FIKRigSolverBase::StaticStruct())) continue;
+		if (S == FIKRigSolverBase::StaticStruct()) continue;          // skip base struct
+		const FString Name = S->GetName();
+		Available.Add(Name);
+		// exact match on Struct->GetName(); also accept the leading-'F' C++ spelling.
+		if (Name.Equals(Want, ESearchCase::IgnoreCase)
+			|| Name.Equals(FString::Printf(TEXT("F%s"), *Want), ESearchCase::IgnoreCase))
+		{
+			Exact = S;   // do NOT break — keep enumerating so 'Available' is complete for errors
+		}
+		else if (Name.Contains(Want, ESearchCase::IgnoreCase))
+		{
+			SubstringMatches.Add(S);
+		}
 	}
 
-	int32 SolverIdx = C->AddSolver(SolverType);
+	UScriptStruct* Resolved = Exact;
+	if (!Resolved)
+	{
+		// Last-resort substring: fire ONLY when exactly one struct contains the term.
+		if (SubstringMatches.Num() == 1)
+		{
+			Resolved = SubstringMatches[0];
+		}
+		else if (SubstringMatches.Num() > 1)
+		{
+			TArray<FString> Names;
+			for (UScriptStruct* S : SubstringMatches) Names.Add(S->GetName());
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Solver type '%s' is ambiguous — matches %d solvers: %s. Use the exact struct name."),
+				*SolverType, SubstringMatches.Num(), *FString::Join(Names, TEXT(", "))));
+		}
+	}
+	if (!Resolved)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Solver type '%s' not found. Available: %s"), *SolverType, *FString::Join(Available, TEXT(", "))));
+	}
+
+	const int32 SolverIdx = C->AddSolver(Resolved);   // UScriptStruct* overload — IKRigController.h:151
 	if (SolverIdx < 0)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to add solver of type '%s' — check type name"), *SolverType));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to add solver of type '%s' (resolved '%s') — AddSolver returned INDEX_NONE"),
+			*SolverType, *Resolved->GetName()));
 	}
+
+	// Canonical resolved name for the result payload.
+	const FString ResolvedName = Resolved->GetName();
 
 	// Optional root bone
 	FString RootBone;
@@ -5154,7 +5238,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddIKSolver(const TShared
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetNumberField(TEXT("solver_index"), SolverIdx);
-	Root->SetStringField(TEXT("solver_type"), SolverType);
+	Root->SetStringField(TEXT("solver_type"), ResolvedName);
 	Root->SetStringField(TEXT("label"), C->GetSolverUniqueName(SolverIdx));
 
 	if (!RootBone.IsEmpty())
@@ -5190,6 +5274,45 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddIKSolver(const TShared
 		Root->SetArrayField(TEXT("warnings"), WarningsArr);
 	}
 
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRemoveIKSolver(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	if (!Params->HasField(TEXT("solver_index")))
+		return FMonolithActionResult::Error(TEXT("solver_index is required"));
+	const int32 SolverIndex = static_cast<int32>(Params->GetNumberField(TEXT("solver_index")));
+
+	const int32 NumSolvers = C->GetNumSolvers();
+	if (SolverIndex < 0 || SolverIndex >= NumSolvers)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Invalid solver_index %d — IK Rig has %d solver(s) (valid range 0..%d)."),
+			SolverIndex, NumSolvers, NumSolvers - 1));
+	}
+
+	// RemoveSolver re-validates the index internally and returns false on failure.
+	if (!C->RemoveSolver(SolverIndex))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("RemoveSolver failed for index %d (IK Rig has %d solver(s))."), SolverIndex, NumSolvers));
+	}
+
+	Asset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("removed_index"), SolverIndex);
+	Root->SetNumberField(TEXT("solver_count_after"), C->GetNumSolvers());
+	Root->SetBoolField(TEXT("saved"), false);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -8164,6 +8287,9 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchExecute(const TShare
 		else if (OpName == TEXT("remove_anim_state"))         SubResult = HandleRemoveAnimState(SubParams);
 		else if (OpName == TEXT("set_anim_entry_state"))      SubResult = HandleSetAnimEntryState(SubParams);
 		else if (OpName == TEXT("remove_anim_transition"))    SubResult = HandleRemoveAnimTransition(SubParams);
+
+		else if (OpName == TEXT("add_ik_solver"))             SubResult = HandleAddIKSolver(SubParams);
+		else if (OpName == TEXT("remove_ik_solver"))          SubResult = HandleRemoveIKSolver(SubParams);
 		// Socket ops
 		else if (OpName == TEXT("add_socket"))                SubResult = HandleAddSocket(SubParams);
 		else if (OpName == TEXT("remove_socket"))             SubResult = HandleRemoveSocket(SubParams);
