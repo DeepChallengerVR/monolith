@@ -26,10 +26,14 @@ public:
 	static FMonolithActionResult HandleSetSectionNext(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetSectionTime(const TSharedPtr<FJsonObject>& Params);
 
-	// --- BlendSpace Samples (3) ---
+	// --- BlendSpace Samples (5) ---
 	static FMonolithActionResult HandleAddBlendSpaceSample(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleEditBlendSpaceSample(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleDeleteBlendSpaceSample(const TSharedPtr<FJsonObject>& Params);
+	// Standalone resample+dirty for already-broken / externally-authored blend spaces.
+	static FMonolithActionResult HandleBakeBlendSpace(const TSharedPtr<FJsonObject>& Params);
+	// Sets bInterpolateUsingGrid + PreferredTriangulationDirection, then rebakes.
+	static FMonolithActionResult HandleSetBlendSpaceInterpolation(const TSharedPtr<FJsonObject>& Params);
 
 	// --- ABP Graph Reading (7) ---
 	static FMonolithActionResult HandleGetStateMachines(const TSharedPtr<FJsonObject>& Params);

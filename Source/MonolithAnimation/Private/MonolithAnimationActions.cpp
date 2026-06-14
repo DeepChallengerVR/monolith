@@ -239,6 +239,26 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("BlendSpace asset path"))
 			.Required(TEXT("sample_index"), TEXT("integer"), TEXT("Index of the sample to delete"))
 			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("bake_blend_space"),
+		TEXT("Rebuild a blend space's triangulation/grid (FBlendSpaceData) by running ResampleData(). "
+			 "Required after programmatic sample/axis edits — without it the runtime reads an empty "
+			 "triangulation and the blend space evaluates to bind/A-pose while the editor preview looks fine. "
+			 "Works on BlendSpace and BlendSpace1D. Marks the package dirty; saving is the caller's concern."),
+		FMonolithActionHandler::CreateStatic(&HandleBakeBlendSpace),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("BlendSpace or BlendSpace1D asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_blend_space_interpolation"),
+		TEXT("Set a blend space's input-interpolation settings: 'use_grid' toggles bInterpolateUsingGrid "
+			 "(true = runtime uses the grid, false = runtime uses the triangulation), and "
+			 "'preferred_triangulation_direction' chooses the edge direction for ambiguous triangulation. "
+			 "Rebuilds the data (ResampleData) so the chosen structure is populated; marks the package dirty."),
+		FMonolithActionHandler::CreateStatic(&HandleSetBlendSpaceInterpolation),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("BlendSpace asset path"))
+			.Optional(TEXT("use_grid"), TEXT("bool"), TEXT("Set bInterpolateUsingGrid: true = grid interpolation, false = triangulation"))
+			.Optional(TEXT("preferred_triangulation_direction"), TEXT("string"), TEXT("None, Tangential, or Radial"))
+			.Build());
 
 	// ABP Graph Reading
 	Registry.RegisterAction(TEXT("animation"), TEXT("get_state_machines"),
@@ -1359,7 +1379,10 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddBlendSpaceSample(const
 	BS->Modify();
 	FVector SampleValue(X, Y, 0.0f);
 	int32 Index = BS->AddSample(Anim, SampleValue);
+	BS->ValidateSampleData();   // clamp/validate sample positions
+	BS->ResampleData();         // rebuild FBlendSpaceData triangulation — REQUIRED for runtime
 	GEditor->EndTransaction();
+	BS->MarkPackageDirty();     // outside the transaction — dirty is not transactional state
 
 	if (Index == INDEX_NONE)
 		return FMonolithActionResult::Error(TEXT("Failed to add sample"));
@@ -1369,6 +1392,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddBlendSpaceSample(const
 	Root->SetStringField(TEXT("animation"), AnimPath);
 	Root->SetNumberField(TEXT("x"), X);
 	Root->SetNumberField(TEXT("y"), Y);
+	Root->SetBoolField(TEXT("baked"), true);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -1403,13 +1427,17 @@ FMonolithActionResult FMonolithAnimationActions::HandleEditBlendSpaceSample(cons
 		}
 	}
 
+	BS->ValidateSampleData();   // clamp/validate sample positions
+	BS->ResampleData();         // rebuild FBlendSpaceData triangulation — REQUIRED for runtime
 	GEditor->EndTransaction();
+	BS->MarkPackageDirty();     // outside the transaction — dirty is not transactional state
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("index"), SampleIndex);
 	Root->SetNumberField(TEXT("x"), X);
 	Root->SetNumberField(TEXT("y"), Y);
 	if (!AnimPath.IsEmpty()) Root->SetStringField(TEXT("animation"), AnimPath);
+	Root->SetBoolField(TEXT("baked"), true);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -1427,13 +1455,88 @@ FMonolithActionResult FMonolithAnimationActions::HandleDeleteBlendSpaceSample(co
 	GEditor->BeginTransaction(FText::FromString(TEXT("Delete BlendSpace Sample")));
 	BS->Modify();
 	bool bSuccess = BS->DeleteSample(SampleIndex);
+	BS->ValidateSampleData();   // clamp/validate sample positions
+	BS->ResampleData();         // rebuild FBlendSpaceData triangulation — REQUIRED for runtime
 	GEditor->EndTransaction();
+	BS->MarkPackageDirty();     // outside the transaction — dirty is not transactional state
 
 	if (!bSuccess)
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to delete sample at index %d"), SampleIndex));
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("deleted_index"), SampleIndex);
+	Root->SetBoolField(TEXT("baked"), true);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleBakeBlendSpace(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UBlendSpace* BS = FMonolithAssetUtils::LoadAssetByPath<UBlendSpace>(AssetPath);
+	if (!BS) return FMonolithActionResult::Error(FString::Printf(TEXT("BlendSpace not found: %s"), *AssetPath));
+
+	const int32 SampleCount = BS->GetBlendSamples().Num();
+
+	BS->ValidateSampleData();   // clamp/validate sample positions
+	BS->ResampleData();         // rebuild FBlendSpaceData triangulation — REQUIRED for runtime
+	BS->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetBoolField(TEXT("baked"), true);
+	Root->SetNumberField(TEXT("sample_count"), SampleCount);
+	Root->SetBoolField(TEXT("has_blendspace_data"), !BS->GetBlendSpaceData().IsEmpty());
+	Root->SetBoolField(TEXT("saved"), false);
+	// 2D triangulation needs >= 3 samples; fewer than that is degenerate (resample is a no-op for 0).
+	if (SampleCount > 0 && SampleCount < 3 && !BS->IsA<UBlendSpace1D>())
+		Root->SetStringField(TEXT("warning"),
+			TEXT("Blend space has fewer than 3 samples — 2D triangulation is degenerate until more are added."));
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetBlendSpaceInterpolation(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UBlendSpace* BS = FMonolithAssetUtils::LoadAssetByPath<UBlendSpace>(AssetPath);
+	if (!BS) return FMonolithActionResult::Error(FString::Printf(TEXT("BlendSpace not found: %s"), *AssetPath));
+
+	if (Params->HasField(TEXT("use_grid")))
+		BS->bInterpolateUsingGrid = Params->GetBoolField(TEXT("use_grid"));
+
+	if (Params->HasField(TEXT("preferred_triangulation_direction")))
+	{
+		FString DirStr = Params->GetStringField(TEXT("preferred_triangulation_direction"));
+		if (DirStr.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+			BS->PreferredTriangulationDirection = EPreferredTriangulationDirection::None;
+		else if (DirStr.Equals(TEXT("Tangential"), ESearchCase::IgnoreCase))
+			BS->PreferredTriangulationDirection = EPreferredTriangulationDirection::Tangential;
+		else if (DirStr.Equals(TEXT("Radial"), ESearchCase::IgnoreCase))
+			BS->PreferredTriangulationDirection = EPreferredTriangulationDirection::Radial;
+		else
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Invalid preferred_triangulation_direction '%s' — must be None, Tangential, or Radial"), *DirStr));
+	}
+
+	// Rebuild so the chosen interpolation structure (grid samples / triangulation) is populated.
+	BS->ResampleData();
+	BS->MarkPackageDirty();
+
+	const TCHAR* DirName = TEXT("Tangential");
+	switch (BS->PreferredTriangulationDirection)
+	{
+	case EPreferredTriangulationDirection::None:       DirName = TEXT("None"); break;
+	case EPreferredTriangulationDirection::Tangential: DirName = TEXT("Tangential"); break;
+	case EPreferredTriangulationDirection::Radial:     DirName = TEXT("Radial"); break;
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetBoolField(TEXT("use_grid"), BS->bInterpolateUsingGrid);
+	Root->SetStringField(TEXT("preferred_triangulation_direction"), DirName);
+	Root->SetBoolField(TEXT("has_blendspace_data"), !BS->GetBlendSpaceData().IsEmpty());
+	Root->SetBoolField(TEXT("saved"), false);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -3769,6 +3872,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetBlendSpaceAxis(const T
 	}
 
 	BS->ValidateSampleData();
+	BS->ResampleData();         // rebuild FBlendSpaceData triangulation — REQUIRED for runtime
 
 	GEditor->EndTransaction();
 	BS->MarkPackageDirty();
@@ -3781,6 +3885,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetBlendSpaceAxis(const T
 	Root->SetNumberField(TEXT("grid_divisions"), BlendParam->GridNum);
 	Root->SetBoolField(TEXT("snap_to_grid"), BlendParam->bSnapToGrid);
 	Root->SetBoolField(TEXT("wrap_input"), BlendParam->bWrapInput);
+	Root->SetBoolField(TEXT("baked"), true);
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -7701,6 +7806,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchExecute(const TShare
 		else if (OpName == TEXT("add_blendspace_sample"))     SubResult = HandleAddBlendSpaceSample(SubParams);
 		else if (OpName == TEXT("edit_blendspace_sample"))    SubResult = HandleEditBlendSpaceSample(SubParams);
 		else if (OpName == TEXT("delete_blendspace_sample"))  SubResult = HandleDeleteBlendSpaceSample(SubParams);
+		else if (OpName == TEXT("bake_blend_space"))          SubResult = HandleBakeBlendSpace(SubParams);
+		else if (OpName == TEXT("set_blend_space_interpolation")) SubResult = HandleSetBlendSpaceInterpolation(SubParams);
 		// Socket ops
 		else if (OpName == TEXT("add_socket"))                SubResult = HandleAddSocket(SubParams);
 		else if (OpName == TEXT("remove_socket"))             SubResult = HandleRemoveSocket(SubParams);

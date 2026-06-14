@@ -64,14 +64,21 @@
 | `set_curve_keys` | Set keys on a float curve (replaces existing keys) |
 | `get_curve_keys` | Get all keys from a float curve |
 
-**BlendSpace Operations (5)**
+**BlendSpace Operations (7)**
+
+> **Auto-bake on mutate (Phase 1).** The four mutators — `add_blendspace_sample`, `edit_blendspace_sample`, `delete_blendspace_sample`, `set_blend_space_axis` — now call `UBlendSpace::ResampleData()` after every edit to rebuild the triangulation (`FBlendSpaceData`), then mark the package dirty. Before this fix they mutated samples WITHOUT rebuilding, so MCP-authored blend spaces shipped with empty triangulation and evaluated to bind/A-pose at runtime — the asset-editor preview recomputed live and masked it. Every sample/axis edit is now correct-by-default (re-baked).
+
+> **`use_grid` vs `has_blendspace_data` semantics.** `has_blendspace_data` is `!FBlendSpaceData::IsEmpty()`. With `use_grid:false` (default — triangulation interpolation) it reports `true` after baking. With `use_grid:true` (grid interpolation) the triangulation array is legitimately EMPTY, so `has_blendspace_data` reports `false` — this is CORRECT for grid mode, not a regression.
+
 | Action | Description |
 |--------|-------------|
 | `get_blend_space_info` | Get blend space samples and axis settings |
-| `add_blendspace_sample` | Add a sample to a blend space |
-| `edit_blendspace_sample` | Edit sample position and optionally its animation |
-| `delete_blendspace_sample` | Delete a sample by index |
-| `set_blend_space_axis` | Configure axis (name, range, grid divisions, snap, wrap) |
+| `add_blendspace_sample` | Add a sample to a blend space. Auto-bakes (`ResampleData` + dirty). |
+| `edit_blendspace_sample` | Edit sample position and optionally its animation. Auto-bakes (`ResampleData` + dirty). |
+| `delete_blendspace_sample` | Delete a sample by index. Auto-bakes (`ResampleData` + dirty). |
+| `set_blend_space_axis` | Configure axis (name, range, grid divisions, snap, wrap). Auto-bakes (`ResampleData` + dirty). |
+| `bake_blend_space` | **(Phase 1)** Standalone resample + dirty for already-broken or externally-authored blend spaces. Params: `asset_path` (required). Runs `ResampleData()`, marks the package dirty, and returns `has_blendspace_data` (`!FBlendSpaceData::IsEmpty()`), `sample_count`, `baked:true`, and a degenerate-sample `warning` when a 2D blend space has fewer than 3 samples (triangulation needs ≥3). Works on 1D (`UBlendSpace1D`) and 2D blend spaces. |
+| `set_blend_space_interpolation` | **(Phase 1)** Set input-interpolation settings, then resample + dirty. Params: `asset_path` (required), `use_grid` (bool, optional → `bInterpolateUsingGrid`), `preferred_triangulation_direction` (string, optional: `None` / `Tangential` / `Radial`). Returns the resulting `use_grid`, `preferred_triangulation_direction`, and `has_blendspace_data` flags. See the `use_grid` semantics note above — grid mode legitimately reports `has_blendspace_data:false`. |
 
 **ABP Graph Reading (8) — read-only**
 | Action | Description |

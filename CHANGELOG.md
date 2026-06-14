@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Blend space baking + interpolation control (`animation`).** Two new actions for getting blend spaces runtime-correct.
+  - `bake_blend_space` — rebuild a blend space's triangulation (`FBlendSpaceData`) via `ResampleData()` and mark it dirty, for blend spaces authored externally or before this release's auto-bake fix. Params: `asset_path`. Returns `has_blendspace_data`, `sample_count`, `baked`, and a `warning` when a 2D blend space has fewer than 3 samples (triangulation needs at least 3). Works on 1D and 2D blend spaces.
+  - `set_blend_space_interpolation` — set a blend space's input-interpolation settings, then resample + dirty. `use_grid` toggles `bInterpolateUsingGrid` (true = runtime uses the grid, false = the triangulation); `preferred_triangulation_direction` chooses the edge direction (`None` / `Tangential` / `Radial`). Returns the resulting flags including `has_blendspace_data`. In grid mode the triangulation is intentionally empty, so `has_blendspace_data` is `false` — that is correct, not a failure.
+
+### Fixed
+
+- **MCP-authored blend spaces played bind/A-pose at runtime (`animation`).** The four blend space mutators — `add_blendspace_sample`, `edit_blendspace_sample`, `delete_blendspace_sample`, `set_blend_space_axis` — mutated samples without rebuilding the triangulation (`FBlendSpaceData`), so a blend space authored over MCP shipped with empty triangulation and evaluated to the bind/reference pose at runtime. The asset-editor preview recomputed the triangulation live, which masked the problem in-editor. Each of the four actions now calls `ResampleData()` after the edit and marks the package dirty, so every sample/axis change re-bakes correctly. Existing broken blend spaces can be repaired in place with the new `bake_blend_space` action.
+
 ## [0.19.0] - 2026-06-13
 
 An LLM-C++-ergonomics release: an eight-action `source` pack so your AI can resolve an include, signature, deprecation, Build.cs deps, header lint, or a UCLASS stub in one round-trip, plus a parser fix that tripled the engine source index. Layered on top: live-PIE introspection + driving (`editor`), anim-node binding read/write and time-series PIE sampling (`animation`), Blueprint variable census + contract reconciliation (`blueprint`), and T3D asset-text export (`project`). Two first-launch crash/load fixes (issue #70, thanks @aggitti) and a ~40% smaller `tools/list` manifest round it out.
