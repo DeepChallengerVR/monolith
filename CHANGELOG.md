@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Remove an IK Rig solver (`animation`).** `remove_ik_solver` removes a solver from an IK Rig's solver stack by index. Params: `asset_path`, `solver_index` (0-based). Validates the index against the current solver count — an out-of-range index returns a clear error naming the valid range — and reports `removed_index` and `solver_count_after`.
 
-- **AnimGraph-authoring pack (`animation`) — 13 new actions.** Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring, composing with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
+- **AnimGraph-authoring pack (`animation`) — 14 new actions.** Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring, composing with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
   - `add_apply_additive` — add an Apply Additive node (Base / Additive / Alpha pins).
   - `add_apply_mesh_space_additive` — add an Apply Mesh-Space Additive node.
   - `add_slot_node` — add a Slot node; validates the slot name against the skeleton's slot groups before spawning.
@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `set_output_pose_source` — wire a node's pose output into the anim graph's Output / Root result pin.
   - `set_state_result_source` — wire a node's pose output into a state machine state's result pin.
   - `add_blend_by_int` — add a Blend Poses by Int node grown to `num_poses` pose pins.
+  - `add_blend_by_enum` — add a Blend Poses by Enum node bound to a `UEnum` (`enum_path`), one pose pin per exposed enumerator plus a Default/else pin; skips the auto `_MAX` sentinel and `Hidden` enumerators. Optional `enumerators` exposes a subset; optional `graph_name` / `state_name` target a specific graph or state. Companion to `add_blend_by_int`.
   - `set_sync_group` — set a player node's sync group name / role / method.
   - `set_layered_blend_bones` — set per-bone branch filters (bone + blend depth) on a Layered Blend Per Bone node.
   - `add_anim_control_rig_node` — add a Control Rig anim-graph node (`control_rig_class`; IO pins regenerate).
@@ -37,6 +38,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`set_anim_node_pin_binding` bootstraps the binding object (`animation`).** The action now constructs a node's binding object when it has none, so it works on previously-unbound AnimGraph nodes instead of refusing them.
 
 - **`auto_layout` built-in formatter (`animation`).** A new `formatter:"builtin"` (also the `"auto"` fallback) lays out anim graphs by dependency-aware layering WITHOUT Blueprint Assist, so layout works in release builds where Blueprint Assist is compiled out.
+
+- **`set_transition_rule` gains an `expression` kind (`animation`).** Compound multi-term transition conditions, extending the existing `bool` / `auto` / `compare` kinds: `terms: [{ lhs, op, rhs, abs?, negate? }]` combined with `combine: "and" | "or"`. Each term builds one comparison sub-node — optional per-term `abs` wraps the left-hand side, optional per-term `negate` inverts the term result — and all terms fold through Boolean AND/OR into the transition result. `get_transition_rule` decodes it back.
 
 ### Fixed
 

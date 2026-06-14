@@ -229,7 +229,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `add_variable_get` | Place a `K2Node_VariableGet` in an ABP anim graph for reading AnimInstance member variables. Validates the variable exists on the skeleton class before spawning |
 | `set_anim_graph_node_property` | Set a property on a previously-placed anim graph node via reflection |
 
-**ABP Graph Authoring (13 — ABP-authoring pack)** — namespace `animation`. Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring. Composes with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
+**ABP Graph Authoring (14 — ABP-authoring pack)** — namespace `animation`. Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring. Composes with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
 
 | Action | Description |
 |--------|-------------|
@@ -241,6 +241,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `set_output_pose_source` | Wire a node's pose output into the anim graph's Output / Root result pin (`UAnimGraphNode_Root` 'Result' input), making the named node drive the final pose. |
 | `set_state_result_source` | Wire a node's pose output into a state machine state's result pin (the state's inner anim-graph output), making the named node drive that state's pose. |
 | `add_blend_by_int` | Add a Blend Poses by Int node, grown to `num_poses` pose input pins. |
+| `add_blend_by_enum` | Add a Blend Poses by Enum node bound to a `UEnum` (`enum_path`), with one pose pin per exposed enumerator plus a Default/else pin. Skips the auto `_MAX` sentinel and `Hidden` enumerators. Optional `enumerators` exposes a subset; optional `graph_name` / `state_name` target a specific graph or state's inner anim graph. Companion to `add_blend_by_int`. |
 | `set_sync_group` | Set a player node's sync group — `name`, `role`, and `method` — so multiple players advance in lockstep. |
 | `set_layered_blend_bones` | Set per-bone branch filters (each a bone + blend depth) on a Layered Blend Per Bone node. |
 | `add_anim_control_rig_node` | Add a Control Rig anim-graph node. Param: `control_rig_class` — its IO pins regenerate from the resolved Control Rig class. |
@@ -295,8 +296,7 @@ Node-level write operations over Animation Blueprint graphs, built for AnimBP re
 | `bool` | `{ kind: "bool", variable: <name> }` | Existing behavior. The variable may be an inherited `BlueprintReadOnly`/`BlueprintVisible` bool on the parent AnimInstance class — validation now walks the skeleton/generated/parent class chain instead of `NewVariables` only, so inherited native bools are accepted. |
 | `auto` | `{ kind: "auto" }` | Existing — sequence-completion automatic rule. |
 | `compare` | `{ kind: "compare", lhs: <variable\|expr>, op: ">"\|"<"\|">="\|"<="\|"=="\|"!=", rhs: <number> }` | Float/numeric comparison against an AnimInstance property (inherited float props validate via the same class-chain walk). |
-
-Full free-form **expression-graph** authoring (e.g. `Abs(X) > 45.0`) is **deferred** — it is the multi-node graph-authoring + compile surface, not yet shipped.
+| `expression` | `{ kind: "expression", terms: [{ lhs, op, rhs, abs?, negate? }], combine: "and"\|"or" }` | Compound multi-term condition. Each term builds one comparison sub-node (optional per-term `abs` wraps the lhs, optional per-term `negate` inverts the term result); all terms fold through Boolean AND/OR (`combine`) into the transition result. `get_transition_rule` decodes it back. |
 
 | Action | Description |
 |--------|-------------|

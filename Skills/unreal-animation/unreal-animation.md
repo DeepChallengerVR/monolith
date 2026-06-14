@@ -42,7 +42,7 @@ description: Use when inspecting or editing Unreal animation assets via Monolith
 | **ABP Writing (EXPERIMENTAL)** | | |
 | `add_state_to_machine` | `asset_path`, `machine_name`, `state_name`, `position_x/y`? | Add state |
 | `add_transition` | `asset_path`, `machine_name`, `from_state`, `to_state` | Add transition |
-| `set_transition_rule` | `asset_path`, `machine_name`, `from_state`, `to_state`, `variable_name` | Wire boolean condition |
+| `set_transition_rule` | `asset_path`, `machine_name`, `from_state`, `to_state`, `variable_name` OR structured `rule` | Wire a transition condition. The `rule` object's `kind` is `bool` / `auto` / `compare` / `expression`; `expression` takes compound multi-term `terms: [{ lhs, op, rhs, abs?, negate? }]` folded through Boolean AND/OR via `combine: "and"|"or"` |
 | `remove_anim_state` | `asset_path`, `machine_name`, `state_name`, `remove_dependent_transitions`? | Remove state + tear down inner graph. Refuses to remove the current entry state — re-point first. `remove_dependent_transitions` defaults `true` |
 | `set_anim_entry_state` | `asset_path`, `machine_name`, `state_name` | Re-point Entry node at an existing state. Returns previous target; `unchanged` when already the entry |
 | `remove_anim_transition` | `asset_path`, `machine_name`, `from_state`, `to_state` | Remove a from→to transition. Reports `matched_transition_count` |
@@ -55,6 +55,7 @@ description: Use when inspecting or editing Unreal animation assets via Monolith
 | `set_output_pose_source` | `asset_path`, `node` | Wire a node's pose output into the anim graph's Output/Root result pin |
 | `set_state_result_source` | `asset_path`, `machine_name`, `state_name`, `node` | Wire a node's pose output into a state's result pin |
 | `add_blend_by_int` | `asset_path`, `num_poses` | Add a Blend Poses by Int node grown to `num_poses` pins |
+| `add_blend_by_enum` | `asset_path`, `enum_path`, `enumerators`?, `graph_name`?, `state_name`? | Add a Blend Poses by Enum node bound to a `UEnum`: one pose pin per exposed enumerator + a Default/else pin. Skips the auto `_MAX` sentinel and `Hidden` enumerators. `enumerators` exposes a subset. Companion to `add_blend_by_int` |
 | `set_sync_group` | `asset_path`, `node`, `name`, `role`?, `method`? | Set a player node's sync group |
 | `set_layered_blend_bones` | `asset_path`, `node`, `bones` | Set per-bone branch filters (bone + blend depth) on a Layered Blend Per Bone node |
 | `add_anim_control_rig_node` | `asset_path`, `control_rig_class` | Add a Control Rig anim-graph node. IO pins regenerate from the class |
@@ -115,3 +116,4 @@ animation_query({ action: "set_section_next", params: { asset_path: "/Game/Anima
 - `add_ik_solver`: `solver_type` resolves against the live solver-struct table (alias -> exact struct name -> unique substring); an ambiguous value returns the candidate list. Full Body IK now adds correctly
 - `auto_layout`: use `formatter: "builtin"` (also the `"auto"` fallback) for a dependency-aware anim-graph layout that works WITHOUT Blueprint Assist, so layout works in release builds where Blueprint Assist is compiled out
 - `set_anim_node_pin_binding` now bootstraps the binding object on previously-unbound nodes, so it works on a node that has no binding yet instead of refusing it
+- `set_transition_rule`: pass a structured `rule` object instead of authoring rule-graph nodes by hand — `kind` is `bool` / `auto` / `compare` / `expression`. The `expression` kind builds compound multi-term conditions (`terms: [{ lhs, op, rhs, abs?, negate? }]` folded through Boolean AND/OR via `combine`); `get_transition_rule` decodes any rule back
