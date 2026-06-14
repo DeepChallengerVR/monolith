@@ -505,7 +505,7 @@ Run via `editor_query("run_automation_tests", "Monolith.ReflectionIntel.Risk")` 
 
 The audit catches a specific bug class: a UPROPERTY (or other reflection-touching declaration) references a symbol from a module that the owning module's `Build.cs` does not list in `PrivateDependencyModuleNames` (or `PublicDependencyModuleNames`). UHT generates `Z_Construct_*_NoRegister` reflection code that calls into the foreign module's API macro at link time — if the dep is missing, the failure surfaces as a downstream LNK2019 with a confusing-looking unresolved external referring to a symbol the developer didn't expect to be a link-time dep.
 
-The bug class is documented in `.claude/agent-memory/<agent>/feedback_softptr_uproperty_needs_module_dep.md` — the canonical example is `TSoftObjectPtr<UWidgetBase>` UPROPERTY in a non-UMG module, where `UMG` is missing from `Build.cs`. Same class also covers FGameplayTag UPROPERTY without `GameplayTags`, FNiagaraSystemAsset without `Niagara`, etc.
+The canonical example of this bug class is `TSoftObjectPtr<UWidgetBase>` UPROPERTY in a non-UMG module, where `UMG` is missing from `Build.cs`. The same class also covers FGameplayTag UPROPERTY without `GameplayTags`, FNiagaraSystemAsset without `Niagara`, etc.
 
 ### 4b.2 Algorithm
 
