@@ -46,6 +46,20 @@ description: Use when inspecting or editing Unreal animation assets via Monolith
 | `remove_anim_state` | `asset_path`, `machine_name`, `state_name`, `remove_dependent_transitions`? | Remove state + tear down inner graph. Refuses to remove the current entry state — re-point first. `remove_dependent_transitions` defaults `true` |
 | `set_anim_entry_state` | `asset_path`, `machine_name`, `state_name` | Re-point Entry node at an existing state. Returns previous target; `unchanged` when already the entry |
 | `remove_anim_transition` | `asset_path`, `machine_name`, `from_state`, `to_state` | Remove a from→to transition. Reports `matched_transition_count` |
+| **ABP Graph Authoring** | | |
+| `add_apply_additive` | `asset_path` | Add an Apply Additive node (Base/Additive/Alpha pins) |
+| `add_apply_mesh_space_additive` | `asset_path` | Add an Apply Mesh-Space Additive node |
+| `add_slot_node` | `asset_path`, `slot_name` | Add a Slot node. `slot_name` validated against the skeleton's slot groups |
+| `add_save_cached_pose` | `asset_path`, `cache_name` | Add a Save Cached Pose node |
+| `add_use_cached_pose` | `asset_path`, `cache_name` | Add a Use Cached Pose node. Pairs by `cache_name` with the matching save |
+| `set_output_pose_source` | `asset_path`, `node` | Wire a node's pose output into the anim graph's Output/Root result pin |
+| `set_state_result_source` | `asset_path`, `machine_name`, `state_name`, `node` | Wire a node's pose output into a state's result pin |
+| `add_blend_by_int` | `asset_path`, `num_poses` | Add a Blend Poses by Int node grown to `num_poses` pins |
+| `set_sync_group` | `asset_path`, `node`, `name`, `role`?, `method`? | Set a player node's sync group |
+| `set_layered_blend_bones` | `asset_path`, `node`, `bones` | Set per-bone branch filters (bone + blend depth) on a Layered Blend Per Bone node |
+| `add_anim_control_rig_node` | `asset_path`, `control_rig_class` | Add a Control Rig anim-graph node. IO pins regenerate from the class |
+| `add_linked_anim_layer` | `asset_path`, `layer_name`, `interface_class`? | Add a Linked Anim Layer node |
+| `add_conduit` | `asset_path`, `machine_name`, `name` | Add a conduit node to a state machine. Its bound graph is a transition-logic graph, not an anim graph |
 | **Notifies** | | |
 | `set_notify_time` | `asset_path`, `notify`, `time` | Move notify |
 | `set_notify_duration` | `asset_path`, `notify`, `duration` | Set notify state duration |
@@ -99,3 +113,5 @@ animation_query({ action: "set_section_next", params: { asset_path: "/Game/Anima
 - `add_control_rig_element`: `animatable` uses `IsAnimatable()` internally -- not a raw bool field
 - Blend space mutators (`add/edit/delete_blendspace_sample`, `set_blend_space_axis`) now auto-bake the triangulation (`ResampleData`) after each edit, so MCP-authored blend spaces no longer ship empty and A-pose at runtime. For blend spaces authored externally or before this fix, call `bake_blend_space` once to repair. In grid mode (`use_grid: true`) an empty triangulation / `has_blendspace_data: false` is correct, not a failure
 - `add_ik_solver`: `solver_type` resolves against the live solver-struct table (alias -> exact struct name -> unique substring); an ambiguous value returns the candidate list. Full Body IK now adds correctly
+- `auto_layout`: use `formatter: "builtin"` (also the `"auto"` fallback) for a dependency-aware anim-graph layout that works WITHOUT Blueprint Assist, so layout works in release builds where Blueprint Assist is compiled out
+- `set_anim_node_pin_binding` now bootstraps the binding object on previously-unbound nodes, so it works on a node that has no binding yet instead of refusing it

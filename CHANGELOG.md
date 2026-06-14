@@ -19,6 +19,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Remove an IK Rig solver (`animation`).** `remove_ik_solver` removes a solver from an IK Rig's solver stack by index. Params: `asset_path`, `solver_index` (0-based). Validates the index against the current solver count — an out-of-range index returns a clear error naming the valid range — and reports `removed_index` and `solver_count_after`.
 
+- **AnimGraph-authoring pack (`animation`) — 13 new actions.** Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring, composing with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
+  - `add_apply_additive` — add an Apply Additive node (Base / Additive / Alpha pins).
+  - `add_apply_mesh_space_additive` — add an Apply Mesh-Space Additive node.
+  - `add_slot_node` — add a Slot node; validates the slot name against the skeleton's slot groups before spawning.
+  - `add_save_cached_pose` — add a Save Cached Pose node (`cache_name`).
+  - `add_use_cached_pose` — add a Use Cached Pose node (`cache_name`; pairs by name with the matching save).
+  - `set_output_pose_source` — wire a node's pose output into the anim graph's Output / Root result pin.
+  - `set_state_result_source` — wire a node's pose output into a state machine state's result pin.
+  - `add_blend_by_int` — add a Blend Poses by Int node grown to `num_poses` pose pins.
+  - `set_sync_group` — set a player node's sync group name / role / method.
+  - `set_layered_blend_bones` — set per-bone branch filters (bone + blend depth) on a Layered Blend Per Bone node.
+  - `add_anim_control_rig_node` — add a Control Rig anim-graph node (`control_rig_class`; IO pins regenerate).
+  - `add_linked_anim_layer` — add a Linked Anim Layer node (`layer_name`, optional `interface_class`).
+  - `add_conduit` — add a conduit node to a state machine (its bound graph is a transition-logic graph, not an anim graph).
+
+- **`set_anim_node_pin_binding` bootstraps the binding object (`animation`).** The action now constructs a node's binding object when it has none, so it works on previously-unbound AnimGraph nodes instead of refusing them.
+
+- **`auto_layout` built-in formatter (`animation`).** A new `formatter:"builtin"` (also the `"auto"` fallback) lays out anim graphs by dependency-aware layering WITHOUT Blueprint Assist, so layout works in release builds where Blueprint Assist is compiled out.
+
 ### Fixed
 
 - **MCP-authored blend spaces played bind/A-pose at runtime (`animation`).** The four blend space mutators — `add_blendspace_sample`, `edit_blendspace_sample`, `delete_blendspace_sample`, `set_blend_space_axis` — mutated samples without rebuilding the triangulation (`FBlendSpaceData`), so a blend space authored over MCP shipped with empty triangulation and evaluated to the bind/reference pose at runtime. The asset-editor preview recomputed the triangulation live, which masked the problem in-editor. Each of the four actions now calls `ResampleData()` after the edit and marks the package dirty, so every sample/axis change re-bakes correctly. Existing broken blend spaces can be repaired in place with the new `bake_blend_space` action.
