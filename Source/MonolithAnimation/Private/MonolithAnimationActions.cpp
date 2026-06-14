@@ -861,7 +861,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("set_transition_rule"),
-		TEXT("Author a state machine transition's condition: a boolean variable, the sequence-player auto rule, or a numeric comparison (var/Abs(var) vs constant). Transaction-safe: rolls back on compile failure with no dirty package."),
+		TEXT("Author a state machine transition's condition: a boolean variable, the sequence-player auto rule, a numeric comparison (var/Abs(var) vs constant), or a compound AND/OR expression of multiple comparison terms. Transaction-safe: rolls back on compile failure with no dirty package."),
 		FMonolithActionHandler::CreateStatic(&HandleSetTransitionRule),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
@@ -869,10 +869,10 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Optional(TEXT("variable_name"), TEXT("string"), TEXT("Legacy/back-compat: boolean variable name. Equivalent to rule={kind:bool, variable:<name>}. Use 'rule' for non-bool conditions."))
-			.Optional(TEXT("rule"), TEXT("object"), TEXT("Structured rule. String 'auto'/'automatic' or a bool variable name also accepted. Object forms: {kind:'bool', variable:'X'} | {kind:'auto'} | {kind:'compare', lhs:'X' or 'Abs(X)', op:'>'|'<'|'>='|'<='|'=='|'!=', rhs:<number>}. (kind:'expression' is not yet supported.)"))
+			.Optional(TEXT("rule"), TEXT("object"), TEXT("Structured rule. String 'auto'/'automatic' or a bool variable name also accepted. Object forms: {kind:'bool', variable:'X'} | {kind:'auto'} | {kind:'compare', lhs:'X' or 'Abs(X)', op:'>'|'<'|'>='|'<='|'=='|'!=', rhs:<number>} | {kind:'expression', combine:'and'|'or' (default 'and'), terms:[{lhs:'X' or 'Abs(X)', op:<compare op>, rhs:<number>, abs?:bool, negate?:bool}, ...]}. The 'expression' kind folds its terms through chained BooleanAND/BooleanOR (a single term degrades to a plain compare)."))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("get_transition_rule"),
-		TEXT("Read back a state machine transition's current rule as structured data (kind=auto/bool/compare/none/custom, operands, op, rhs, comparison string)."),
+		TEXT("Read back a state machine transition's current rule as structured data (kind=auto/bool/compare/expression/none/custom, operands, op, rhs, comparison string; expression rules report combine + decoded terms)."),
 		FMonolithActionHandler::CreateStatic(&HandleGetTransitionRule),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
@@ -6156,6 +6156,18 @@ FMonolithActionResult FMonolithAnimationActions::HandleRemoveAnimTransition(cons
 	return FMonolithActionResult::Success(Root);
 }
 
+// One comparison term of a compound expression rule: the same per-term grammar the `compare`
+// kind already parses (lhs operand variable, optional Abs(...), op, numeric rhs), plus an
+// optional per-term boolean negation applied via Not_PreBool.
+struct FExprTerm
+{
+	FString Variable;     // lhs operand variable name
+	bool    bUseAbs = false; // wrap lhs in Abs(...)
+	FString Op;           // one of > < >= <= == !=
+	double  Rhs = 0.0;    // constant right-hand side
+	bool    bNegate = false; // wrap the term's bool result in Not_PreBool
+};
+
 // Parsed representation of a structured transition rule. A plain-string `rule` collapses to
 // kind=bool (variable) or kind=auto, preserving full back-compat with the legacy string form.
 struct FParsedTransitionRule
@@ -6167,6 +6179,8 @@ struct FParsedTransitionRule
 	FString Op;           // compare: one of > < >= <= == !=
 	double  Rhs = 0.0;    // compare: constant right-hand side
 	FString ExpressionText; // expression kind: raw text (deferred)
+	TArray<FExprTerm> Terms; // expression kind: structured AND/OR terms
+	FString Combine;      // expression kind: "and" | "or" (default "and")
 	FString ParseError;   // populated when Kind == Invalid
 };
 
@@ -6273,22 +6287,224 @@ static FParsedTransitionRule ParseTransitionRule(const TSharedPtr<FJsonObject>& 
 	}
 	if (Kind.Equals(TEXT("expression"), ESearchCase::IgnoreCase))
 	{
-		// Arbitrary-expression graph authoring is intentionally NOT implemented in this pass —
-		// safe parsing + multi-node graph synthesis of free-form expressions is too large to do
-		// robustly here. Callers needing magnitude/threshold rules use kind=compare instead.
-		RuleObj->TryGetStringField(TEXT("text"), Out.ExpressionText);
+		// Structured compound rule: an array of comparison `terms` (each reusing the `compare`
+		// grammar) reduced through a single `combine` boolean operator. No free-form text parser.
+		FString Combine = TEXT("and");
+		if (RuleObj->HasField(TEXT("combine")))
+		{
+			RuleObj->TryGetStringField(TEXT("combine"), Combine);
+		}
+		Combine = Combine.TrimStartAndEnd();
+		if (!Combine.Equals(TEXT("and"), ESearchCase::IgnoreCase) && !Combine.Equals(TEXT("or"), ESearchCase::IgnoreCase))
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = FString::Printf(TEXT("rule.kind=expression 'combine' must be 'and' or 'or' (got '%s')."), *Combine);
+			return Out;
+		}
+		Out.Combine = Combine.ToLower();
+
+		const TArray<TSharedPtr<FJsonValue>>* TermsArr = nullptr;
+		if (!RuleObj->TryGetArrayField(TEXT("terms"), TermsArr) || !TermsArr)
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=expression requires a 'terms' array of { lhs, op, rhs, abs?, negate? } objects.");
+			return Out;
+		}
+		if (TermsArr->Num() == 0)
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=expression requires at least one term in 'terms'.");
+			return Out;
+		}
+
+		for (int32 Ti = 0; Ti < TermsArr->Num(); ++Ti)
+		{
+			const TSharedPtr<FJsonValue>& TermVal = (*TermsArr)[Ti];
+			const TSharedPtr<FJsonObject>* TermObjPtr = nullptr;
+			if (!TermVal.IsValid() || !TermVal->TryGetObject(TermObjPtr) || !TermObjPtr || !TermObjPtr->IsValid())
+			{
+				Out.Kind = FParsedTransitionRule::EKind::Invalid;
+				Out.ParseError = FString::Printf(TEXT("rule.kind=expression term %d is not an object { lhs, op, rhs, abs?, negate? }."), Ti);
+				return Out;
+			}
+			const TSharedPtr<FJsonObject>& TermObj = *TermObjPtr;
+
+			FExprTerm Term;
+
+			FString Lhs;
+			if (!TermObj->TryGetStringField(TEXT("lhs"), Lhs) || Lhs.IsEmpty())
+			{
+				Out.Kind = FParsedTransitionRule::EKind::Invalid;
+				Out.ParseError = FString::Printf(TEXT("rule.kind=expression term %d requires a non-empty 'lhs' (variable name, optionally 'Abs(Var)')."), Ti);
+				return Out;
+			}
+			// Allow lhs of the form "Abs(Var)" (mirrors the compare grammar).
+			FString LhsTrimmed = Lhs.TrimStartAndEnd();
+			if (LhsTrimmed.StartsWith(TEXT("Abs(")) && LhsTrimmed.EndsWith(TEXT(")")))
+			{
+				Term.bUseAbs = true;
+				Term.Variable = LhsTrimmed.Mid(4, LhsTrimmed.Len() - 5).TrimStartAndEnd();
+			}
+			else
+			{
+				TermObj->TryGetBoolField(TEXT("abs"), Term.bUseAbs);
+				Term.Variable = LhsTrimmed;
+			}
+			if (Term.Variable.IsEmpty())
+			{
+				Out.Kind = FParsedTransitionRule::EKind::Invalid;
+				Out.ParseError = FString::Printf(TEXT("rule.kind=expression term %d 'lhs' resolved to an empty operand name."), Ti);
+				return Out;
+			}
+
+			FString Op;
+			if (!TermObj->TryGetStringField(TEXT("op"), Op) || CompareOpToKismetFunctionName(Op).IsNone())
+			{
+				Out.Kind = FParsedTransitionRule::EKind::Invalid;
+				Out.ParseError = FString::Printf(TEXT("rule.kind=expression term %d requires 'op' to be one of: > < >= <= == != ."), Ti);
+				return Out;
+			}
+			Term.Op = Op;
+
+			double Rhs = 0.0;
+			if (!TermObj->TryGetNumberField(TEXT("rhs"), Rhs))
+			{
+				Out.Kind = FParsedTransitionRule::EKind::Invalid;
+				Out.ParseError = FString::Printf(TEXT("rule.kind=expression term %d requires a numeric 'rhs' constant."), Ti);
+				return Out;
+			}
+			Term.Rhs = Rhs;
+
+			TermObj->TryGetBoolField(TEXT("negate"), Term.bNegate);
+
+			Out.Terms.Add(Term);
+		}
+
 		Out.Kind = FParsedTransitionRule::EKind::Expression;
 		return Out;
 	}
 
 	Out.Kind = FParsedTransitionRule::EKind::Invalid;
-	Out.ParseError = FString::Printf(TEXT("Unknown rule.kind '%s'. Supported: bool, auto, compare. (expression is not yet supported.)"), *Kind);
+	Out.ParseError = FString::Printf(TEXT("Unknown rule.kind '%s'. Supported: bool, auto, compare, expression."), *Kind);
 	return Out;
 }
 
-// Author a float-compare rule into a transition's bound rule graph: VariableGet(lhs) ->
-// [optional Abs] -> Compare(op, rhs) -> result.bCanEnterTransition. Pure node authoring +
-// wiring only; the CALLER owns the transaction, compile, and rollback. Returns true on full
+// Build ONE comparison's nodes into a transition rule graph: VariableGet(lhs) -> [optional Abs]
+// -> Compare(op, rhs), and RETURN the comparison's bool ReturnValue pin (NOT wired to anything).
+// Pure node authoring; the CALLER owns Modify()/BreakAllPinLinks(), the transaction, the result
+// wiring, the compile, and rollback. RowY/ColBaseX let the caller stack multiple subgraphs
+// vertically (expression terms) or place a single one (compare). Returns the bool result pin on
+// success; on failure returns nullptr and fills OutError so the caller can roll back.
+static UEdGraphPin* BuildCompareSubgraph(
+	UEdGraph* RuleGraph,
+	const FString& Lhs,
+	bool bUseAbs,
+	const FString& Op,
+	double Rhs,
+	int32 ColBaseX,
+	int32 RowY,
+	FString& OutError)
+{
+	if (!RuleGraph)
+	{
+		OutError = TEXT("Internal: null rule graph.");
+		return nullptr;
+	}
+
+	const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+	if (!RuleSchema)
+	{
+		OutError = TEXT("Rule graph has no schema.");
+		return nullptr;
+	}
+
+	// 1) VariableGet for the lhs operand. SetSelfMember resolves inherited members too
+	//    (same idiom as the bool-rule path).
+	UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
+	VarGetNode->VariableReference.SetSelfMember(FName(*Lhs));
+	RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+	VarGetNode->NodePosX = ColBaseX - 600;
+	VarGetNode->NodePosY = RowY;
+	VarGetNode->AllocateDefaultPins();
+
+	UEdGraphPin* VarOutPin = FindVariableGetOutputPin(VarGetNode, Lhs);
+	if (!VarOutPin)
+	{
+		OutError = FString::Printf(TEXT("Could not resolve output pin for operand '%s' (variable may not exist or is not readable)."), *Lhs);
+		return nullptr;
+	}
+
+	// 2) Optional Abs(double) node.
+	UEdGraphPin* LhsValuePin = VarOutPin;
+	if (bUseAbs)
+	{
+		UFunction* AbsFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Abs"));
+		if (!AbsFn)
+		{
+			OutError = TEXT("Internal: UKismetMathLibrary::Abs not found.");
+			return nullptr;
+		}
+		UK2Node_CallFunction* AbsNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+		AbsNode->SetFromFunction(AbsFn);
+		RuleGraph->AddNode(AbsNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		AbsNode->NodePosX = ColBaseX - 400;
+		AbsNode->NodePosY = RowY;
+		AbsNode->AllocateDefaultPins();
+
+		UEdGraphPin* AbsInPin  = AbsNode->FindPin(TEXT("A"), EGPD_Input);
+		UEdGraphPin* AbsOutPin = AbsNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+		if (!AbsInPin || !AbsOutPin)
+		{
+			OutError = TEXT("Abs node missing expected pins (A / ReturnValue).");
+			return nullptr;
+		}
+		if (!RuleSchema->TryCreateConnection(VarOutPin, AbsInPin))
+		{
+			OutError = FString::Printf(TEXT("Failed to wire operand '%s' into Abs."), *Lhs);
+			return nullptr;
+		}
+		LhsValuePin = AbsOutPin;
+	}
+
+	// 3) Comparison node.
+	const FName CmpFnName = CompareOpToKismetFunctionName(Op);
+	UFunction* CmpFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(CmpFnName);
+	if (!CmpFn)
+	{
+		OutError = FString::Printf(TEXT("Internal: comparison function '%s' not found."), *CmpFnName.ToString());
+		return nullptr;
+	}
+	UK2Node_CallFunction* CmpNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+	CmpNode->SetFromFunction(CmpFn);
+	RuleGraph->AddNode(CmpNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+	CmpNode->NodePosX = ColBaseX - 200;
+	CmpNode->NodePosY = RowY;
+	CmpNode->AllocateDefaultPins();
+
+	UEdGraphPin* CmpAPin   = CmpNode->FindPin(TEXT("A"), EGPD_Input);
+	UEdGraphPin* CmpBPin   = CmpNode->FindPin(TEXT("B"), EGPD_Input);
+	UEdGraphPin* CmpRetPin = CmpNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+	if (!CmpAPin || !CmpBPin || !CmpRetPin)
+	{
+		OutError = TEXT("Comparison node missing expected pins (A / B / ReturnValue).");
+		return nullptr;
+	}
+
+	if (!RuleSchema->TryCreateConnection(LhsValuePin, CmpAPin))
+	{
+		OutError = TEXT("Failed to wire operand into comparison input A.");
+		return nullptr;
+	}
+	// rhs constant -> default value on the B pin.
+	CmpBPin->DefaultValue = FString::SanitizeFloat(Rhs);
+
+	OutError.Empty();
+	return CmpRetPin;
+}
+
+// Author a single float-compare rule into a transition's bound rule graph: builds the comparison
+// subgraph and wires its bool result straight into result.bCanEnterTransition. Pure node authoring
+// + wiring only; the CALLER owns the transaction, compile, and rollback. Returns true on full
 // wire-through; on any failure fills OutError and the caller must roll the transaction back.
 static bool AuthorCompareRuleNodes(
 	UEdGraph* RuleGraph,
@@ -6316,93 +6532,182 @@ static bool AuthorCompareRuleNodes(
 	RuleGraph->Modify();
 	ResultPin->BreakAllPinLinks();
 
-	const int32 BaseX = ResultNode->NodePosX;
-	const int32 BaseY = ResultNode->NodePosY;
-
-	// 1) VariableGet for the lhs operand. SetSelfMember resolves inherited members too
-	//    (same idiom as the bool-rule path).
-	UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
-	VarGetNode->VariableReference.SetSelfMember(FName(*Lhs));
-	RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
-	VarGetNode->NodePosX = BaseX - 600;
-	VarGetNode->NodePosY = BaseY;
-	VarGetNode->AllocateDefaultPins();
-
-	UEdGraphPin* VarOutPin = FindVariableGetOutputPin(VarGetNode, Lhs);
-	if (!VarOutPin)
+	UEdGraphPin* CmpRetPin = BuildCompareSubgraph(
+		RuleGraph, Lhs, bUseAbs, Op, Rhs,
+		/*ColBaseX=*/ResultNode->NodePosX, /*RowY=*/ResultNode->NodePosY, OutError);
+	if (!CmpRetPin)
 	{
-		OutError = FString::Printf(TEXT("Could not resolve output pin for operand '%s' (variable may not exist or is not readable)."), *Lhs);
 		return false;
 	}
 
-	// 2) Optional Abs(double) node.
-	UEdGraphPin* LhsValuePin = VarOutPin;
-	if (bUseAbs)
-	{
-		UFunction* AbsFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Abs"));
-		if (!AbsFn)
-		{
-			OutError = TEXT("Internal: UKismetMathLibrary::Abs not found.");
-			return false;
-		}
-		UK2Node_CallFunction* AbsNode = NewObject<UK2Node_CallFunction>(RuleGraph);
-		AbsNode->SetFromFunction(AbsFn);
-		RuleGraph->AddNode(AbsNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
-		AbsNode->NodePosX = BaseX - 400;
-		AbsNode->NodePosY = BaseY;
-		AbsNode->AllocateDefaultPins();
-
-		UEdGraphPin* AbsInPin  = AbsNode->FindPin(TEXT("A"), EGPD_Input);
-		UEdGraphPin* AbsOutPin = AbsNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
-		if (!AbsInPin || !AbsOutPin)
-		{
-			OutError = TEXT("Abs node missing expected pins (A / ReturnValue).");
-			return false;
-		}
-		if (!RuleSchema->TryCreateConnection(VarOutPin, AbsInPin))
-		{
-			OutError = FString::Printf(TEXT("Failed to wire operand '%s' into Abs."), *Lhs);
-			return false;
-		}
-		LhsValuePin = AbsOutPin;
-	}
-
-	// 3) Comparison node.
-	const FName CmpFnName = CompareOpToKismetFunctionName(Op);
-	UFunction* CmpFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(CmpFnName);
-	if (!CmpFn)
-	{
-		OutError = FString::Printf(TEXT("Internal: comparison function '%s' not found."), *CmpFnName.ToString());
-		return false;
-	}
-	UK2Node_CallFunction* CmpNode = NewObject<UK2Node_CallFunction>(RuleGraph);
-	CmpNode->SetFromFunction(CmpFn);
-	RuleGraph->AddNode(CmpNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
-	CmpNode->NodePosX = BaseX - 200;
-	CmpNode->NodePosY = BaseY;
-	CmpNode->AllocateDefaultPins();
-
-	UEdGraphPin* CmpAPin   = CmpNode->FindPin(TEXT("A"), EGPD_Input);
-	UEdGraphPin* CmpBPin   = CmpNode->FindPin(TEXT("B"), EGPD_Input);
-	UEdGraphPin* CmpRetPin = CmpNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
-	if (!CmpAPin || !CmpBPin || !CmpRetPin)
-	{
-		OutError = TEXT("Comparison node missing expected pins (A / B / ReturnValue).");
-		return false;
-	}
-
-	if (!RuleSchema->TryCreateConnection(LhsValuePin, CmpAPin))
-	{
-		OutError = TEXT("Failed to wire operand into comparison input A.");
-		return false;
-	}
-	// rhs constant -> default value on the B pin.
-	CmpBPin->DefaultValue = FString::SanitizeFloat(Rhs);
-
-	// 4) Compare result -> bCanEnterTransition.
+	// Compare result -> bCanEnterTransition.
 	if (!RuleSchema->TryCreateConnection(CmpRetPin, ResultPin))
 	{
 		OutError = TEXT("Failed to wire comparison result into bCanEnterTransition.");
+		return false;
+	}
+
+	OutError.Empty();
+	return true;
+}
+
+// Author a compound expression rule: build one compare subgraph per term, apply Not_PreBool to any
+// negated term, then left-fold the per-term bool pins through chained BooleanAND/BooleanOR (per
+// Combine) and wire the final folded pin into result.bCanEnterTransition. A single term degrades to
+// a plain compare (no fold node). Before authoring, the existing rule nodes (everything except the
+// result node) are removed so re-authoring does not litter the graph. Pure node authoring; the
+// CALLER owns the transaction, compile, and rollback. Returns true on success; on any failure fills
+// OutError and the caller must roll the transaction back.
+static bool AuthorExpressionRuleNodes(
+	UAnimBlueprint* ABP,
+	UEdGraph* RuleGraph,
+	UAnimGraphNode_TransitionResult* ResultNode,
+	UEdGraphPin* ResultPin,
+	const TArray<FExprTerm>& Terms,
+	const FString& Combine,
+	FString& OutError)
+{
+	if (!ABP || !RuleGraph || !ResultNode || !ResultPin)
+	{
+		OutError = TEXT("Internal: null ABP / rule graph / result node / result pin.");
+		return false;
+	}
+	if (Terms.Num() == 0)
+	{
+		OutError = TEXT("kind:expression requires at least one term.");
+		return false;
+	}
+
+	const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+	if (!RuleSchema)
+	{
+		OutError = TEXT("Rule graph has no schema.");
+		return false;
+	}
+
+	RuleGraph->Modify();
+	ResultPin->BreakAllPinLinks();
+
+	// Clear the prior rule graph (keep the result node) so re-authoring leaves no orphaned nodes.
+	// RemoveNode breaks links + invokes DestroyNode (proper rule-subgraph teardown); inside the
+	// caller's open transaction so rollback restores them. bDontRecompile — the caller's compile
+	// is authoritative.
+	{
+		TArray<UEdGraphNode*> NodesToRemove;
+		for (UEdGraphNode* N : RuleGraph->Nodes)
+		{
+			if (N && N != ResultNode)
+			{
+				NodesToRemove.Add(N);
+			}
+		}
+		for (UEdGraphNode* N : NodesToRemove)
+		{
+			FBlueprintEditorUtils::RemoveNode(ABP, N, /*bDontRecompile=*/true);
+		}
+	}
+
+	const int32 ColBaseX = ResultNode->NodePosX;
+	const int32 BaseY = ResultNode->NodePosY;
+
+	// 1) Build one comparison subgraph per term, capturing its bool result pin (optionally negated).
+	TArray<UEdGraphPin*> TermBoolPins;
+	TermBoolPins.Reserve(Terms.Num());
+	for (int32 Ti = 0; Ti < Terms.Num(); ++Ti)
+	{
+		const FExprTerm& Term = Terms[Ti];
+		const int32 RowY = BaseY + Ti * 150;
+
+		UEdGraphPin* TermBoolPin = BuildCompareSubgraph(
+			RuleGraph, Term.Variable, Term.bUseAbs, Term.Op, Term.Rhs, ColBaseX, RowY, OutError);
+		if (!TermBoolPin)
+		{
+			OutError = FString::Printf(TEXT("term %d (%s): %s"), Ti, *Term.Variable, *OutError);
+			return false;
+		}
+
+		// Optional per-term negation via Not_PreBool.
+		if (Term.bNegate)
+		{
+			UFunction* NotFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Not_PreBool"));
+			if (!NotFn)
+			{
+				OutError = TEXT("Internal: UKismetMathLibrary::Not_PreBool not found.");
+				return false;
+			}
+			UK2Node_CallFunction* NotNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+			NotNode->SetFromFunction(NotFn);
+			RuleGraph->AddNode(NotNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+			NotNode->NodePosX = ColBaseX - 120;
+			NotNode->NodePosY = RowY;
+			NotNode->AllocateDefaultPins();
+
+			UEdGraphPin* NotInPin  = NotNode->FindPin(TEXT("A"), EGPD_Input);
+			UEdGraphPin* NotOutPin = NotNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+			if (!NotInPin || !NotOutPin)
+			{
+				OutError = FString::Printf(TEXT("term %d: Not_PreBool node missing expected pins (A / ReturnValue)."), Ti);
+				return false;
+			}
+			if (!RuleSchema->TryCreateConnection(TermBoolPin, NotInPin))
+			{
+				OutError = FString::Printf(TEXT("term %d: failed to wire comparison into Not_PreBool."), Ti);
+				return false;
+			}
+			TermBoolPin = NotOutPin;
+		}
+
+		TermBoolPins.Add(TermBoolPin);
+	}
+
+	// 2) Single term -> wire its bool straight into the result (no fold node).
+	UEdGraphPin* FinalBoolPin = TermBoolPins[0];
+
+	// 3) Multiple terms -> left-fold through chained BooleanAND / BooleanOR.
+	if (TermBoolPins.Num() > 1)
+	{
+		const bool bUseAnd = Combine.Equals(TEXT("and"), ESearchCase::IgnoreCase);
+		const FName BoolFnName = bUseAnd ? FName(TEXT("BooleanAND")) : FName(TEXT("BooleanOR"));
+		UFunction* BoolFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(BoolFnName);
+		if (!BoolFn)
+		{
+			OutError = FString::Printf(TEXT("Internal: UKismetMathLibrary::%s not found."), *BoolFnName.ToString());
+			return false;
+		}
+
+		UEdGraphPin* AccPin = TermBoolPins[0];
+		for (int32 Ki = 1; Ki < TermBoolPins.Num(); ++Ki)
+		{
+			UK2Node_CallFunction* FoldNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+			FoldNode->SetFromFunction(BoolFn);
+			RuleGraph->AddNode(FoldNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+			FoldNode->NodePosX = ColBaseX - 60;
+			FoldNode->NodePosY = BaseY + Ki * 150;
+			FoldNode->AllocateDefaultPins();
+
+			UEdGraphPin* FoldAPin   = FoldNode->FindPin(TEXT("A"), EGPD_Input);
+			UEdGraphPin* FoldBPin   = FoldNode->FindPin(TEXT("B"), EGPD_Input);
+			UEdGraphPin* FoldRetPin = FoldNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+			if (!FoldAPin || !FoldBPin || !FoldRetPin)
+			{
+				OutError = FString::Printf(TEXT("%s node missing expected pins (A / B / ReturnValue)."), *BoolFnName.ToString());
+				return false;
+			}
+			if (!RuleSchema->TryCreateConnection(AccPin, FoldAPin) ||
+				!RuleSchema->TryCreateConnection(TermBoolPins[Ki], FoldBPin))
+			{
+				OutError = FString::Printf(TEXT("Failed to wire term %d into the %s fold chain."), Ki, *BoolFnName.ToString());
+				return false;
+			}
+			AccPin = FoldRetPin;
+		}
+		FinalBoolPin = AccPin;
+	}
+
+	// 4) Final folded (or single) bool -> bCanEnterTransition.
+	if (!RuleSchema->TryCreateConnection(FinalBoolPin, ResultPin))
+	{
+		OutError = TEXT("Failed to wire expression result into bCanEnterTransition.");
 		return false;
 	}
 
@@ -6494,15 +6799,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Invalid)
 	{
 		return FMonolithActionResult::Error(ParsedRule.ParseError.IsEmpty()
-			? TEXT("Invalid rule. Provide 'variable_name' (legacy bool), or 'rule' as a string or { kind: bool|auto|compare }.")
+			? TEXT("Invalid rule. Provide 'variable_name' (legacy bool), or 'rule' as a string or { kind: bool|auto|compare|expression }.")
 			: ParsedRule.ParseError);
-	}
-
-	// expression: explicit, clean deferral — no fragile graph surgery shipped this pass.
-	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Expression)
-	{
-		return FMonolithActionResult::Error(
-			TEXT("kind:expression not yet supported. Use kind:compare for var/Abs(var) vs constant (op one of > < >= <= == !=)."));
 	}
 
 	// --- Operand validation (before touching the graph) ----------------------------------
@@ -6535,6 +6833,24 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 		{
 			return FMonolithActionResult::Error(FString::Printf(
 				TEXT("Compare operand '%s' is not a usable numeric variable (no BP float/int or inherited Blueprint-visible float). Use get_abp_variables to list available variables."), *ParsedRule.Variable));
+		}
+	}
+	else if (ParsedRule.Kind == FParsedTransitionRule::EKind::Expression)
+	{
+		if (ParsedRule.Terms.Num() == 0)
+		{
+			return FMonolithActionResult::Error(TEXT("kind:expression requires at least one term in 'terms'."));
+		}
+		// Each term's operand must be a usable numeric, exactly as kind:compare requires.
+		for (int32 Ti = 0; Ti < ParsedRule.Terms.Num(); ++Ti)
+		{
+			FString FoundCat;
+			if (!IsUsableFloatOperand(ABP, ParsedRule.Terms[Ti].Variable, FoundCat))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("kind:expression term %d operand '%s' is not a usable numeric variable (no BP float/int or inherited Blueprint-visible float). Use get_abp_variables to list available variables."),
+					Ti, *ParsedRule.Terms[Ti].Variable));
+			}
 		}
 	}
 
@@ -6648,10 +6964,15 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 			AuthorError = FString::Printf(TEXT("Failed to wire bool variable '%s' into the rule result."), *ParsedRule.Variable);
 		}
 	}
-	else // Compare
+	else if (ParsedRule.Kind == FParsedTransitionRule::EKind::Compare)
 	{
 		bAuthored = AuthorCompareRuleNodes(RuleGraph, ResultNode, ResultPin,
 			ParsedRule.Variable, ParsedRule.bUseAbs, ParsedRule.Op, ParsedRule.Rhs, AuthorError);
+	}
+	else if (ParsedRule.Kind == FParsedTransitionRule::EKind::Expression)
+	{
+		bAuthored = AuthorExpressionRuleNodes(ABP, RuleGraph, ResultNode, ResultPin,
+			ParsedRule.Terms, ParsedRule.Combine, AuthorError);
 	}
 
 	if (!bAuthored)
@@ -6705,7 +7026,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 		Root->SetStringField(TEXT("variable_name"), ParsedRule.Variable);
 		Root->SetBoolField(TEXT("pin_wired"), true);
 	}
-	else // Compare
+	else if (ParsedRule.Kind == FParsedTransitionRule::EKind::Compare)
 	{
 		Root->SetStringField(TEXT("rule_kind"), TEXT("compare"));
 		const FString LhsDisplay = ParsedRule.bUseAbs
@@ -6720,6 +7041,38 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 			FString::Printf(TEXT("%s %s %s"), *LhsDisplay, *ParsedRule.Op, *FString::SanitizeFloat(ParsedRule.Rhs)));
 		Root->SetBoolField(TEXT("pin_wired"), true);
 	}
+	else // Expression
+	{
+		Root->SetStringField(TEXT("rule_kind"), TEXT("expression"));
+		Root->SetStringField(TEXT("combine"), ParsedRule.Combine);
+		Root->SetNumberField(TEXT("term_count"), ParsedRule.Terms.Num());
+
+		TArray<TSharedPtr<FJsonValue>> TermArr;
+		TArray<FString> CompareStrings;
+		for (const FExprTerm& Term : ParsedRule.Terms)
+		{
+			const FString LhsDisplay = Term.bUseAbs ? FString::Printf(TEXT("Abs(%s)"), *Term.Variable) : Term.Variable;
+			const FString Cmp = FString::Printf(TEXT("%s%s %s %s"),
+				Term.bNegate ? TEXT("NOT ") : TEXT(""),
+				*LhsDisplay, *Term.Op, *FString::SanitizeFloat(Term.Rhs));
+			CompareStrings.Add(Cmp);
+
+			TSharedPtr<FJsonObject> TermObj = MakeShared<FJsonObject>();
+			TermObj->SetStringField(TEXT("lhs"), LhsDisplay);
+			TermObj->SetStringField(TEXT("operand"), Term.Variable);
+			TermObj->SetBoolField(TEXT("abs"), Term.bUseAbs);
+			TermObj->SetStringField(TEXT("op"), Term.Op);
+			TermObj->SetNumberField(TEXT("rhs"), Term.Rhs);
+			TermObj->SetBoolField(TEXT("negate"), Term.bNegate);
+			TermObj->SetStringField(TEXT("comparison"), Cmp);
+			TermArr.Add(MakeShared<FJsonValueObject>(TermObj));
+		}
+		Root->SetArrayField(TEXT("terms"), TermArr);
+
+		const FString Joiner = ParsedRule.Combine.Equals(TEXT("or"), ESearchCase::IgnoreCase) ? TEXT(" OR ") : TEXT(" AND ");
+		Root->SetStringField(TEXT("expression"), FString::Join(CompareStrings, *Joiner));
+		Root->SetBoolField(TEXT("pin_wired"), true);
+	}
 
 	if (Warnings.Num() > 0)
 	{
@@ -6730,11 +7083,102 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 	return FMonolithActionResult::Success(Root);
 }
 
+// Map a KismetMathLibrary double-comparison function name back to its operator token (inverse of
+// CompareOpToKismetFunctionName). Returns empty for a non-comparison function.
+static FString KismetCompareFnToOp(const FName& N)
+{
+	if (N == TEXT("Greater_DoubleDouble"))      return TEXT(">");
+	if (N == TEXT("Less_DoubleDouble"))         return TEXT("<");
+	if (N == TEXT("GreaterEqual_DoubleDouble")) return TEXT(">=");
+	if (N == TEXT("LessEqual_DoubleDouble"))    return TEXT("<=");
+	if (N == TEXT("EqualEqual_DoubleDouble"))   return TEXT("==");
+	if (N == TEXT("NotEqual_DoubleDouble"))     return TEXT("!=");
+	return FString();
+}
+
+// Decode a single bool-producing node (a comparison CallFunction, optionally fronted by Not_PreBool)
+// into a structured term JSON object { lhs, operand, abs, op, rhs, negate, comparison }. Returns the
+// object on a recognized comparison term, or nullptr if the node is not a decodable compare term.
+static TSharedPtr<FJsonObject> DecodeExpressionTerm(UEdGraphNode* BoolNode)
+{
+	bool bNegate = false;
+	UK2Node_CallFunction* CmpNode = Cast<UK2Node_CallFunction>(BoolNode);
+
+	// Peel an optional Not_PreBool wrapper to reach the comparison node.
+	if (CmpNode && CmpNode->FunctionReference.GetMemberName() == TEXT("Not_PreBool"))
+	{
+		bNegate = true;
+		UK2Node_CallFunction* NotNode = CmpNode;
+		CmpNode = nullptr;
+		if (UEdGraphPin* NotAPin = NotNode->FindPin(TEXT("A"), EGPD_Input))
+		{
+			if (NotAPin->LinkedTo.Num() > 0 && NotAPin->LinkedTo[0])
+			{
+				CmpNode = Cast<UK2Node_CallFunction>(NotAPin->LinkedTo[0]->GetOwningNode());
+			}
+		}
+	}
+
+	if (!CmpNode) return nullptr;
+	const FString Op = KismetCompareFnToOp(CmpNode->FunctionReference.GetMemberName());
+	if (Op.IsEmpty()) return nullptr;
+
+	double Rhs = 0.0;
+	if (UEdGraphPin* BPin = CmpNode->FindPin(TEXT("B"), EGPD_Input))
+	{
+		Rhs = FCString::Atod(*BPin->DefaultValue);
+	}
+
+	bool bUsesAbs = false;
+	FString OperandName;
+	if (UEdGraphPin* APin = CmpNode->FindPin(TEXT("A"), EGPD_Input))
+	{
+		if (APin->LinkedTo.Num() > 0 && APin->LinkedTo[0])
+		{
+			UEdGraphNode* UpstreamNode = APin->LinkedTo[0]->GetOwningNode();
+			if (UK2Node_CallFunction* MaybeAbs = Cast<UK2Node_CallFunction>(UpstreamNode))
+			{
+				if (MaybeAbs->FunctionReference.GetMemberName() == TEXT("Abs"))
+				{
+					bUsesAbs = true;
+					if (UEdGraphPin* AbsAPin = MaybeAbs->FindPin(TEXT("A"), EGPD_Input))
+					{
+						if (AbsAPin->LinkedTo.Num() > 0 && AbsAPin->LinkedTo[0])
+						{
+							if (UK2Node_VariableGet* InnerVar = Cast<UK2Node_VariableGet>(AbsAPin->LinkedTo[0]->GetOwningNode()))
+							{
+								OperandName = InnerVar->VariableReference.GetMemberName().ToString();
+							}
+						}
+					}
+				}
+			}
+			else if (UK2Node_VariableGet* DirectVar = Cast<UK2Node_VariableGet>(UpstreamNode))
+			{
+				OperandName = DirectVar->VariableReference.GetMemberName().ToString();
+			}
+		}
+	}
+
+	const FString LhsDisplay = bUsesAbs ? FString::Printf(TEXT("Abs(%s)"), *OperandName) : OperandName;
+	TSharedPtr<FJsonObject> TermObj = MakeShared<FJsonObject>();
+	TermObj->SetStringField(TEXT("lhs"), LhsDisplay);
+	TermObj->SetStringField(TEXT("operand"), OperandName);
+	TermObj->SetBoolField(TEXT("abs"), bUsesAbs);
+	TermObj->SetStringField(TEXT("op"), Op);
+	TermObj->SetNumberField(TEXT("rhs"), Rhs);
+	TermObj->SetBoolField(TEXT("negate"), bNegate);
+	TermObj->SetStringField(TEXT("comparison"),
+		FString::Printf(TEXT("%s%s %s %s"), bNegate ? TEXT("NOT ") : TEXT(""), *LhsDisplay, *Op, *FString::SanitizeFloat(Rhs)));
+	return TermObj;
+}
+
 // Read back a transition's current rule (kind + operands + comparison) as structured data.
 // Inspects the transition's bound rule graph: bAutomaticRuleBasedOnSequencePlayerInState ->
 // auto; a single bool VariableGet feeding the result -> bool; a comparison CallFunction (with
-// optional Abs upstream) -> compare. Anything else is reported as kind:custom with the node
-// titles, rather than failing.
+// optional Abs upstream) -> compare; a BooleanAND/BooleanOR fold (or a single Not_PreBool) feeding
+// the result -> expression with decoded terms. Anything else is reported as kind:custom with the
+// node titles, rather than failing.
 FMonolithActionResult FMonolithAnimationActions::HandleGetTransitionRule(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
@@ -6799,21 +7243,88 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetTransitionRule(const T
 		return FMonolithActionResult::Success(Root);
 	}
 
+	// Expression: a BooleanAND / BooleanOR fold (multi-term), or a single Not_PreBool (one negated
+	// term), drives the result. Walk the fold chain back to its leaf comparison terms.
+	if (UK2Node_CallFunction* DrivingFn = Cast<UK2Node_CallFunction>(DrivingNode))
+	{
+		const FName DrivingFnName = DrivingFn->FunctionReference.GetMemberName();
+		const bool bIsAnd = DrivingFnName == TEXT("BooleanAND");
+		const bool bIsOr  = DrivingFnName == TEXT("BooleanOR");
+		const bool bIsNot = DrivingFnName == TEXT("Not_PreBool");
+
+		if (bIsAnd || bIsOr || bIsNot)
+		{
+			// Collect leaf bool-producing nodes in author order. The fold is a strict left-fold:
+			// each BooleanAND/OR node's A pin links to the previous accumulator (the upstream fold
+			// node, or the first term) and its B pin links to the next term. Walk the chain of A
+			// pins iteratively, gathering B-pin terms, then the innermost A leaf is term 0. A leaf
+			// is a compare or Not_PreBool node.
+			auto UpstreamOf = [](UK2Node_CallFunction* Fn, const TCHAR* PinName) -> UEdGraphNode*
+			{
+				if (UEdGraphPin* P = Fn->FindPin(PinName, EGPD_Input))
+				{
+					if (P->LinkedTo.Num() > 0 && P->LinkedTo[0]) { return P->LinkedTo[0]->GetOwningNode(); }
+				}
+				return nullptr;
+			};
+
+			TArray<UEdGraphNode*> LeafNodes; // reverse author order while walking; reversed below
+			UEdGraphNode* Cursor = DrivingNode;
+			int32 FoldGuard = 0;
+			while (Cursor && FoldGuard++ < 256)
+			{
+				UK2Node_CallFunction* Fn = Cast<UK2Node_CallFunction>(Cursor);
+				const FName FnName = Fn ? Fn->FunctionReference.GetMemberName() : NAME_None;
+				if (Fn && (FnName == TEXT("BooleanAND") || FnName == TEXT("BooleanOR")))
+				{
+					LeafNodes.Add(UpstreamOf(Fn, TEXT("B")));   // this fold's right-hand term
+					Cursor = UpstreamOf(Fn, TEXT("A"));          // descend into the accumulator
+				}
+				else
+				{
+					LeafNodes.Add(Cursor); // innermost leaf (term 0) or the single Not_PreBool
+					break;
+				}
+			}
+			// Restore author order (term 0 .. term N-1) — the walk gathered them innermost-last.
+			for (int32 Lo = 0, Hi = LeafNodes.Num() - 1; Lo < Hi; ++Lo, --Hi)
+			{
+				UEdGraphNode* Tmp = LeafNodes[Lo];
+				LeafNodes[Lo] = LeafNodes[Hi];
+				LeafNodes[Hi] = Tmp;
+			}
+
+			TArray<TSharedPtr<FJsonValue>> TermArr;
+			TArray<FString> CompareStrings;
+			bool bAllDecoded = true;
+			for (UEdGraphNode* Leaf : LeafNodes)
+			{
+				TSharedPtr<FJsonObject> TermObj = DecodeExpressionTerm(Leaf);
+				if (!TermObj) { bAllDecoded = false; break; }
+				CompareStrings.Add(TermObj->GetStringField(TEXT("comparison")));
+				TermArr.Add(MakeShared<FJsonValueObject>(TermObj));
+			}
+
+			if (bAllDecoded && TermArr.Num() > 0)
+			{
+				const FString Combine = bIsOr ? TEXT("or") : TEXT("and");
+				Root->SetStringField(TEXT("rule_kind"), TEXT("expression"));
+				Root->SetStringField(TEXT("combine"), Combine);
+				Root->SetNumberField(TEXT("term_count"), TermArr.Num());
+				Root->SetArrayField(TEXT("terms"), TermArr);
+				const FString Joiner = bIsOr ? TEXT(" OR ") : TEXT(" AND ");
+				Root->SetStringField(TEXT("expression"), FString::Join(CompareStrings, *Joiner));
+				return FMonolithActionResult::Success(Root);
+			}
+			// Fall through to the compare/custom decode below if the chain was not cleanly decodable.
+		}
+	}
+
 	// Compare: a comparison CallFunction drives the result.
 	if (UK2Node_CallFunction* CmpNode = Cast<UK2Node_CallFunction>(DrivingNode))
 	{
 		const FName FnName = CmpNode->FunctionReference.GetMemberName();
-		auto KismetFnToOp = [](const FName& N) -> FString
-		{
-			if (N == TEXT("Greater_DoubleDouble"))      return TEXT(">");
-			if (N == TEXT("Less_DoubleDouble"))         return TEXT("<");
-			if (N == TEXT("GreaterEqual_DoubleDouble")) return TEXT(">=");
-			if (N == TEXT("LessEqual_DoubleDouble"))    return TEXT("<=");
-			if (N == TEXT("EqualEqual_DoubleDouble"))   return TEXT("==");
-			if (N == TEXT("NotEqual_DoubleDouble"))     return TEXT("!=");
-			return FString();
-		};
-		const FString Op = KismetFnToOp(FnName);
+		const FString Op = KismetCompareFnToOp(FnName);
 		if (Op.IsEmpty())
 		{
 			Root->SetStringField(TEXT("rule_kind"), TEXT("custom"));
@@ -7283,7 +7794,10 @@ FMonolithActionResult FMonolithAnimationActions::HandleBuildStateMachine(const T
 				}
 				if (Parsed.Kind == FParsedTransitionRule::EKind::Expression)
 				{
-					Rep->SetStringField(TEXT("rule_deferred"), TEXT("kind:expression not yet supported. Use kind:compare."));
+					// Inline expression authoring is intentionally DEFERRED here (parity decision):
+					// the standalone set_transition_rule action covers kind:expression. Call it after
+					// build_state_machine for any compound AND/OR transition rule.
+					Rep->SetStringField(TEXT("rule_deferred"), TEXT("kind:expression deferred in build_state_machine; use the standalone set_transition_rule action for compound AND/OR rules."));
 					TransReport.Add(MakeShared<FJsonValueObject>(Rep));
 					continue;
 				}
