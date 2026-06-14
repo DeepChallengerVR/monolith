@@ -367,7 +367,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 		TEXT("Bind (or clear) a PIN on an animation graph node to a property-access path. ")
 		TEXT("Pass path as a string array (e.g. ['CharacterState','Speed']); an empty/omitted path clears the binding. ")
 		TEXT("After the write the node is reconstructed so the binding's pin type is re-derived, then the Animation Blueprint is recompiled. ")
-		TEXT("v1 requires the node to already have a binding object (author one pin binding in-editor first if the node has none). ")
+		TEXT("Works even when the node has no existing binding: the binding object is created on demand if absent. ")
 		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_ModifyBone_0', pin: 'Alpha', path: ['CharacterState','Alpha'] }."),
 		FMonolithActionHandler::CreateStatic(&HandleSetAnimNodePinBinding),
 		FParamSchemaBuilder()
@@ -835,6 +835,19 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
 			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name (exact, as shown in get_state_machines)"))
 			.Required(TEXT("state_name"), TEXT("string"), TEXT("Name for the new state"))
+			.Optional(TEXT("position_x"), TEXT("integer"), TEXT("Node X position (default: 200)"), TEXT("200"))
+			.Optional(TEXT("position_y"), TEXT("integer"), TEXT("Node Y position (default: 0)"), TEXT("0"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_conduit"),
+		TEXT("Add a conduit node to an existing state machine. A conduit is a shared transition hub: transitions route INTO it and its internal boolean rule gates onward transitions. "
+			 "NOTE: a conduit's bound graph is a TRANSITION-LOGIC graph (a boolean rule graph), NOT an anim/pose graph - it has no pose sink, so do not target it with pose-pin actions "
+			 "(set_state_result_source, add_anim_graph_node with a player node, etc.). The result reports graph_kind='transition_logic'. Transitions to/from the conduit use the existing add_transition. "
+			 "Recompiles the blueprint; marks the package dirty (saving is the caller's concern)."),
+		FMonolithActionHandler::CreateStatic(&HandleAddConduit),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name (exact, as shown in get_state_machines)"))
+			.Required(TEXT("conduit_name"), TEXT("string"), TEXT("Name for the new conduit"))
 			.Optional(TEXT("position_x"), TEXT("integer"), TEXT("Node X position (default: 200)"), TEXT("200"))
 			.Optional(TEXT("position_y"), TEXT("integer"), TEXT("Node Y position (default: 0)"), TEXT("0"))
 			.Build());
@@ -5663,6 +5676,104 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddStateToMachine(const T
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("machine_name"), MachineName);
 	Root->SetStringField(TEXT("state_name"), NewNode->GetStateName());
+	Root->SetNumberField(TEXT("position_x"), NewNode->NodePosX);
+	Root->SetNumberField(TEXT("position_y"), NewNode->NodePosY);
+	return FMonolithActionResult::Success(Root);
+}
+
+// Find an existing conduit node in a state machine graph by its display name.
+// A conduit derives its name from its BoundGraph, exactly like a state.
+static UAnimStateConduitNode* FindConduitNodeByName(UAnimationStateMachineGraph* SMGraph, const FString& ConduitName)
+{
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		UAnimStateConduitNode* Conduit = Cast<UAnimStateConduitNode>(Node);
+		if (Conduit && Conduit->GetStateName() == ConduitName)
+		{
+			return Conduit;
+		}
+	}
+	return nullptr;
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddConduit(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString ConduitName = Params->GetStringField(TEXT("conduit_name"));
+
+	double TempVal;
+	int32 PosX = 200;
+	int32 PosY = 0;
+	if (Params->TryGetNumberField(TEXT("position_x"), TempVal)) PosX = static_cast<int32>(TempVal);
+	if (Params->TryGetNumberField(TEXT("position_y"), TempVal)) PosY = static_cast<int32>(TempVal);
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (ConduitName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: conduit_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	// Reject name collisions against existing states AND conduits (both share the
+	// state-name namespace, since a conduit's name derives from its BoundGraph).
+	if (FindStateNodeByName(SMGraph, ConduitName))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("A state named '%s' already exists in machine '%s'"), *ConduitName, *MachineName));
+	}
+	if (FindConduitNodeByName(SMGraph, ConduitName))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("A conduit named '%s' already exists in machine '%s'"), *ConduitName, *MachineName));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Conduit to Machine")));
+	SMGraph->Modify();
+
+	// Conduits spawn through the same state-node template path as UAnimStateNode.
+	// SpawnNodeFromTemplate runs the editor drag-drop code path, whose
+	// PostPlacedNewNode() creates the conduit's BoundGraph subgraph.
+	UAnimStateConduitNode* NewNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateConduitNode>(
+		SMGraph,
+		NewObject<UAnimStateConduitNode>(SMGraph),
+		FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)),
+		/*bSelectNewNode=*/false);
+
+	if (!NewNode)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Failed to spawn conduit node"));
+	}
+
+	// IMPORTANT: a conduit's BoundGraph is a TRANSITION-LOGIC graph (a boolean rule
+	// graph), NOT an anim/pose graph. It has no pose sink — pose-pin actions
+	// (set_state_result_source, add_anim_graph_node with a player node, etc.) must
+	// NOT target it. See AnimStateConduitNode.h:19.
+	if (!NewNode->BoundGraph)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Conduit node created but BoundGraph is null — conduit may be corrupt"));
+	}
+
+	// Rename via the BoundGraph so GetStateName() returns the desired conduit name.
+	{
+		TSharedPtr<INameValidatorInterface> NameValidator = FNameValidatorFactory::MakeValidator(NewNode);
+		FBlueprintEditorUtils::RenameGraphWithSuggestion(NewNode->BoundGraph, NameValidator, ConduitName);
+	}
+
+	GEditor->EndTransaction();
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("conduit_name"), NewNode->GetStateName());
+	Root->SetStringField(TEXT("bound_graph"), NewNode->BoundGraph->GetName());
+	// Tag the bound graph kind so callers do not target it with pose-pin actions.
+	Root->SetStringField(TEXT("graph_kind"), TEXT("transition_logic"));
 	Root->SetNumberField(TEXT("position_x"), NewNode->NodePosX);
 	Root->SetNumberField(TEXT("position_y"), NewNode->NodePosY);
 	return FMonolithActionResult::Success(Root);
@@ -10646,7 +10757,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 	FMapProperty* MapProp = nullptr;
 	void* MapPtr = nullptr;
 	UObject* BindingObj = nullptr;
-	const bool bHasMap = MonolithAnimNodeBindingReader::ResolvePropertyBindingsMap(AnimNode, MapProp, MapPtr, BindingObj);
+	bool bHasMap = MonolithAnimNodeBindingReader::ResolvePropertyBindingsMap(AnimNode, MapProp, MapPtr, BindingObj);
 
 	if (bClearing)
 	{
@@ -10662,15 +10773,57 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 	}
 	else
 	{
-		// Plan-sanctioned v1 fallback: creating a default binding object reflectively
-		// (NewObject on a class resolved by name) is fragile; require an existing binding
-		// object and return a clear error. A binding object exists once any binding (pin
-		// or via the editor) has been authored on the node.
+		// Zero-bootstrap: if the node has no binding object yet, create it ourselves,
+		// mirroring the engine's lazy-create. UAnimGraphNode_Base::EnsureBindingsArePresent()
+		// is PROTECTED (AnimGraphNode_Base.h:658, under the protected: at :579), so it is
+		// NOT callable from this external module. Instead we replicate its body
+		// (AnimGraphNode_Base.cpp:200-215): NewObject the binding from the ABP's default
+		// binding class, falling back to AnimGraphNodeBinding_Base when the default is null,
+		// and write it onto the node's `Binding` UPROPERTY reflectively (the concrete
+		// UAnimGraphNodeBinding_Base type lives in AnimGraph/Internal and is not reachable
+		// here, so we resolve its UClass by path and treat the binding as a plain UObject*).
+		// We then RE-RESOLVE the PropertyBindings map (now present) and proceed with the same
+		// AddPair + ReconstructNode path used when a binding already existed.
 		if (!bHasMap)
 		{
-			return FMonolithActionResult::Error(
-				TEXT("This node has no binding object (or no PropertyBindings map). v1 requires an ")
-				TEXT("existing binding - author at least one pin binding in-editor first, then retry."));
+			// 1. ABP's configured default binding class (public inline, AnimBlueprint.h:245).
+			UClass* BindingClass = ABP->GetDefaultBindingClass();
+			// 2. Engine fallback when the default is null (AnimGraphNode_Base.cpp:207-210).
+			//    UAnimGraphNodeBinding_Base is not includable from this module; resolve its
+			//    UClass by script path (the AllowedClasses meta at AnimBlueprint.h:285).
+			if (!BindingClass)
+			{
+				BindingClass = FindObject<UClass>(nullptr, TEXT("/Script/AnimGraph.AnimGraphNodeBinding_Base"));
+			}
+			if (!BindingClass)
+			{
+				return FMonolithActionResult::Error(
+					TEXT("Failed to resolve a binding class for this node (the ABP has no default ")
+					TEXT("binding class and AnimGraphNodeBinding_Base could not be found)."));
+			}
+
+			// 3. Create the binding subobject outered to the node (mirrors AnimGraphNode_Base.cpp:212).
+			UObject* NewBindingObj = NewObject<UObject>(AnimNode, BindingClass);
+
+			// 4. Write it onto the node's `Binding` FObjectProperty reflectively. This is the
+			//    same property the reader reads at MonolithAnimNodeBindingReader.h:139-141.
+			//    SetObjectPropertyValue_InContainer is public (CoreUObject UnrealType.h:2851).
+			FObjectProperty* BindProp = FindFProperty<FObjectProperty>(AnimNode->GetClass(), TEXT("Binding"));
+			if (!BindProp)
+			{
+				return FMonolithActionResult::Error(
+					TEXT("Node has no reflectable 'Binding' property (layout drift); cannot create a binding."));
+			}
+			BindProp->SetObjectPropertyValue_InContainer(AnimNode, NewBindingObj);
+
+			// 5. Re-resolve the now-present PropertyBindings map.
+			bHasMap = MonolithAnimNodeBindingReader::ResolvePropertyBindingsMap(AnimNode, MapProp, MapPtr, BindingObj);
+			if (!bHasMap)
+			{
+				return FMonolithActionResult::Error(
+					TEXT("Failed to create a binding object on this node (no PropertyBindings map after ")
+					TEXT("bootstrap). The node may lack a UAnimBlueprint outer."));
+			}
 		}
 
 		FStructProperty* ValueStructProp = CastField<FStructProperty>(MapProp->ValueProp);
@@ -10685,11 +10838,13 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 		}
 
 		// Build the binding value. Mirrors AnimGraphNodeBinding_Base.cpp:486-499.
-		// NOTE: RecalculateBindingType (which derives PinType/PromotedPinType from the
-		// property path) is a PRIVATE static and unreachable. We DO NOT set PinType here;
-		// instead we trigger re-derivation via ReconstructNode() below — see the
-		// re-derive comment. PathAsText is a display field; set it to the dotted path so
-		// the binding reads cleanly even before the reconstruct refreshes it.
+		// NOTE: PinType/PromotedPinType (derived from the property path by
+		// UAnimGraphNode_Base::RecalculateBindingType) are not set here; we trigger
+		// re-derivation via ReconstructNode() below — see the re-derive comment.
+		// (RecalculateBindingType is PUBLIC + UE_API in 5.7, AnimGraphNode_Base.h:649,
+		// but driving it through ReconstructNode keeps a single re-derive path.)
+		// PathAsText is a display field; set it to the dotted path so the binding reads
+		// cleanly even before the reconstruct refreshes it.
 		FAnimGraphNodePropertyBinding NewBinding;
 		NewBinding.PropertyName = PinName;
 		NewBinding.PropertyPath = Path;
@@ -10707,10 +10862,12 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 
 	// --- Re-derive trigger (the plan's CRITICAL OPEN DETAIL) ---
 	// Verified in engine source: the binding-type re-derivation lives in
-	// UAnimGraphNodeBinding_Base::RecalculateBindingType (private/static, unreachable).
-	// It is invoked by UAnimGraphNodeBinding_Base::OnReconstructNode, which loops over
-	// every entry in PropertyBindings (AnimGraphNodeBinding_Base.cpp:80-90). That
-	// override fires from the engine's own write path via AnimGraphNode->ReconstructNode()
+	// UAnimGraphNode_Base::RecalculateBindingType (PUBLIC + UE_API in 5.7,
+	// AnimGraphNode_Base.h:649 — it is reachable, but we drive it through the engine's
+	// own re-derive path rather than calling it directly). It is invoked by
+	// UAnimGraphNodeBinding_Base::OnReconstructNode, which loops over every entry in
+	// PropertyBindings (AnimGraphNodeBinding_Base.cpp:80-90). That override fires from the
+	// engine's own write path via AnimGraphNode->ReconstructNode()
 	// (AnimGraphNodeBinding_Base.cpp:503). UEdGraphNode::ReconstructNode() is PUBLIC
 	// (EdGraphNode.h:711), so we call it directly to re-derive PinType/PromotedPinType
 	// before compiling. CompileBlueprint alone is NOT relied upon for the re-derive.

@@ -150,6 +150,9 @@ public:
 
 	// --- Wave 10: ABP Write Experimental (3) ---
 	static FMonolithActionResult HandleAddStateToMachine(const TSharedPtr<FJsonObject>& Params);
+	// add_conduit — spawn a UAnimStateConduitNode (a transition hub) into a state
+	// machine. Its BoundGraph is a transition-logic graph, NOT an anim/pose graph.
+	static FMonolithActionResult HandleAddConduit(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddTransition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params);
 	// Phase 6 — read back a transition's authored rule (kind + operands + comparison).
