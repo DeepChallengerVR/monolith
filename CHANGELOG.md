@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+### Fixed
+
+## [0.20.0] - 2026-06-14
+
+### Added
+
 - **Blend space baking + interpolation control (`animation`).** Two new actions for getting blend spaces runtime-correct.
   - `bake_blend_space` — rebuild a blend space's triangulation (`FBlendSpaceData`) via `ResampleData()` and mark it dirty, for blend spaces authored externally or before this release's auto-bake fix. Params: `asset_path`. Returns `has_blendspace_data`, `sample_count`, `baked`, and a `warning` when a 2D blend space has fewer than 3 samples (triangulation needs at least 3). Works on 1D and 2D blend spaces.
   - `set_blend_space_interpolation` — set a blend space's input-interpolation settings, then resample + dirty. `use_grid` toggles `bInterpolateUsingGrid` (true = runtime uses the grid, false = the triangulation); `preferred_triangulation_direction` chooses the edge direction (`None` / `Tangential` / `Radial`). Returns the resulting flags including `has_blendspace_data`. In grid mode the triangulation is intentionally empty, so `has_blendspace_data` is `false` — that is correct, not a failure.
