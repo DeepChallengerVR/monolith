@@ -154,6 +154,14 @@ public:
 	// Phase 6 — read back a transition's authored rule (kind + operands + comparison).
 	static FMonolithActionResult HandleGetTransitionRule(const TSharedPtr<FJsonObject>& Params);
 
+	// --- State-machine editing: removal + entry re-point ---
+	// State/transition nodes own a BoundGraph, so removal routes through
+	// FBlueprintEditorUtils::RemoveNode -> DestroyNode (tears down the inner graph)
+	// rather than a bare UEdGraph::RemoveNode.
+	static FMonolithActionResult HandleRemoveAnimState(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetAnimEntryState(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveAnimTransition(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Wave 16: State Machine Authoring (#13/#14) ---
 	// create_state_machine — spawn a UAnimGraphNode_StateMachine into an ABP's anim graph.
 	// build_state_machine  — declarative builder composing create + add states/transitions/rules.

@@ -859,6 +859,42 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Build());
 
+	// State-machine editing — removal + entry re-point.
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_anim_state"),
+		TEXT("Remove a state from a state machine by name. Also removes the state's dependent transitions "
+			 "(incoming + outgoing) when remove_dependent_transitions is true (default); if false and "
+			 "transitions exist, errors rather than orphaning them. Refuses to remove the current entry state "
+			 "(re-point it with set_anim_entry_state first). The state's inner anim graph is torn down "
+			 "automatically. Recompiles the blueprint; marks the package dirty (saving is the caller's concern)."),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveAnimState),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("state_name"), TEXT("string"), TEXT("State to remove"))
+			.Optional(TEXT("remove_dependent_transitions"), TEXT("bool"), TEXT("Also remove transitions into/out of this state (default: true). If false and transitions exist, the call errors."), TEXT("true"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_anim_entry_state"),
+		TEXT("Re-point a state machine's entry/initial state to a different existing state. Breaks the entry "
+			 "node's current link and wires it to the named state's input pin. Recompiles the blueprint; "
+			 "marks the package dirty (saving is the caller's concern)."),
+		FMonolithActionHandler::CreateStatic(&HandleSetAnimEntryState),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("state_name"), TEXT("string"), TEXT("State to make the entry/initial state"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_anim_transition"),
+		TEXT("Remove the transition between two named states (directed from_state -> to_state). The transition's "
+			 "rule subgraph is torn down automatically. Recompiles the blueprint; marks the package dirty "
+			 "(saving is the caller's concern)."),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveAnimTransition),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
+			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
+			.Build());
+
 	// Wave 16 — State Machine Authoring (#13 / #14)
 	Registry.RegisterAction(TEXT("animation"), TEXT("create_state_machine"),
 		TEXT("Spawn a new state machine node into an Animation Blueprint's anim graph (auto-creates the SM graph + entry node)"),
@@ -5570,6 +5606,322 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddTransition(const TShar
 	return FMonolithActionResult::Success(Root);
 }
 
+// Helper: find the single entry node of a state machine graph. A well-formed SM has exactly one.
+static UAnimStateEntryNode* FindEntryNode(UAnimationStateMachineGraph* SMGraph)
+{
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		if (UAnimStateEntryNode* Entry = Cast<UAnimStateEntryNode>(Node))
+		{
+			return Entry;
+		}
+	}
+	return nullptr;
+}
+
+// Helper: resolve the state currently wired to the entry node's output pin, or nullptr if none.
+static UAnimStateNodeBase* GetEntryTargetState(UAnimStateEntryNode* EntryNode)
+{
+	if (!EntryNode) return nullptr;
+	UEdGraphPin* EntryOut = EntryNode->GetOutputPin();
+	if (!EntryOut) return nullptr;
+	for (UEdGraphPin* Linked : EntryOut->LinkedTo)
+	{
+		if (Linked)
+		{
+			if (UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(Linked->GetOwningNode()))
+			{
+				return State;
+			}
+		}
+	}
+	return nullptr;
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRemoveAnimState(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor) return FMonolithActionResult::Error(TEXT("GEditor unavailable"));
+
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString StateName   = Params->GetStringField(TEXT("state_name"));
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (StateName.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: state_name"));
+
+	bool bRemoveDependentTransitions = true;
+	Params->TryGetBoolField(TEXT("remove_dependent_transitions"), bRemoveDependentTransitions);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateNode* StateNode = FindStateNodeByName(SMGraph, StateName);
+	if (!StateNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *StateName, *MachineName));
+
+	// Guard: refuse to remove the current entry-target — it would leave the entry node dangling.
+	// Caller should re-point the entry via set_anim_entry_state first.
+	if (UAnimStateEntryNode* EntryNode = FindEntryNode(SMGraph))
+	{
+		if (GetEntryTargetState(EntryNode) == StateNode)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("State '%s' is the current entry state of machine '%s'. Re-point the entry with set_anim_entry_state before removing it."),
+				*StateName, *MachineName));
+		}
+	}
+
+	// Enumerate ALL transitions whose from-state OR to-state is this state, by scanning the graph's
+	// transition nodes and matching the directed endpoints by name. UAnimStateNodeBase::GetTransitionList
+	// is NOT a complete dependency set: it returns this state's outgoing transitions plus only its
+	// *bidirectional* incoming ones (AnimStateNodeBase.cpp) — an incoming non-bidirectional transition is
+	// missed. Such a transition is still swept when the state is removed (its link to us breaks, triggering
+	// UAnimStateTransitionNode::PinConnectionListChanged self-destruct), so counting via GetTransitionList
+	// under-reports. A full-graph scan keyed on both endpoints captures every dependent transition.
+	// Snapshot into local arrays up front so the count and names reflect exactly what gets swept, and so the
+	// removal loop iterates a stable copy (RemoveNode mutates SMGraph->Nodes and cascades self-destructs).
+	TArray<UAnimStateTransitionNode*> DepTransitions;
+	TArray<FString> DepTransitionLabels;
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		UAnimStateTransitionNode* Trans = Cast<UAnimStateTransitionNode>(Node);
+		if (!Trans) continue;
+		UAnimStateNodeBase* Prev = Trans->GetPreviousState();
+		UAnimStateNodeBase* Next = Trans->GetNextState();
+		const bool bTouchesState =
+			(Prev && Prev->GetStateName() == StateName) ||
+			(Next && Next->GetStateName() == StateName);
+		if (!bTouchesState) continue;
+		DepTransitions.Add(Trans);
+		DepTransitionLabels.Add(FString::Printf(TEXT("%s->%s"),
+			Prev ? *Prev->GetStateName() : TEXT("?"),
+			Next ? *Next->GetStateName() : TEXT("?")));
+	}
+
+	if (!bRemoveDependentTransitions && DepTransitions.Num() > 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("State '%s' has %d dependent transition(s): %s. Pass remove_dependent_transitions:true to remove them too."),
+			*StateName, DepTransitions.Num(), *FString::Join(DepTransitionLabels, TEXT(", "))));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Remove Anim State")));
+	SMGraph->Modify();
+
+	// Remove the dependent transitions FIRST, before the state, iterating the up-front snapshot (never a
+	// live node list — RemoveNode mutates SMGraph->Nodes and each removal can cascade self-destructs).
+	// Do NOT pre-break their links — UAnimStateTransitionNode::PinConnectionListChanged self-destroys the
+	// node when links hit zero (AnimStateTransitionNode.cpp), which would invalidate the pointer before
+	// RemoveNode runs. RemoveNode breaks links + invokes DestroyNode (rule-subgraph teardown) itself.
+	// Build the reported list from the pre-captured snapshot labels so the count is exactly what we sweep,
+	// regardless of the cascade order. Removing the transitions here means the subsequent state removal has
+	// nothing left to cascade onto them (their pointers are already gone), so no double-remove can occur.
+	TArray<TSharedPtr<FJsonValue>> RemovedTransitions;
+	if (bRemoveDependentTransitions)
+	{
+		for (int32 Index = 0; Index < DepTransitions.Num(); ++Index)
+		{
+			UAnimStateTransitionNode* Trans = DepTransitions[Index];
+			if (!Trans) continue;
+			RemovedTransitions.Add(MakeShared<FJsonValueString>(DepTransitionLabels[Index]));
+			FBlueprintEditorUtils::RemoveNode(ABP, Trans, /*bDontRecompile=*/true);
+		}
+	}
+
+	// Remove the state node. UAnimStateNode::DestroyNode() auto-collects the state's BoundGraph via
+	// FBlueprintEditorUtils::RemoveGraph(..., EGraphRemoveFlags::Recompile) — do NOT call RemoveGraph
+	// here (double-remove). The Recompile flag inside DestroyNode fires a recompile regardless of
+	// bDontRecompile; the final CompileBlueprint below is the authoritative pass.
+	FBlueprintEditorUtils::RemoveNode(ABP, StateNode, /*bDontRecompile=*/true);
+
+	GEditor->EndTransaction();
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	const bool bCompileOk = (ABP->Status == EBlueprintStatus::BS_UpToDate
+		|| ABP->Status == EBlueprintStatus::BS_UpToDateWithWarnings);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("removed_state"), StateName);
+	Root->SetArrayField(TEXT("removed_transitions"), RemovedTransitions);
+	Root->SetNumberField(TEXT("removed_transition_count"), RemovedTransitions.Num());
+	Root->SetBoolField(TEXT("compile_ok"), bCompileOk);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetAnimEntryState(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor) return FMonolithActionResult::Error(TEXT("GEditor unavailable"));
+
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString StateName   = Params->GetStringField(TEXT("state_name"));
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (StateName.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: state_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateEntryNode* EntryNode = FindEntryNode(SMGraph);
+	if (!EntryNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' has no entry node (corrupt)"), *MachineName));
+
+	UAnimStateNode* TargetState = FindStateNodeByName(SMGraph, StateName);
+	if (!TargetState) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *StateName, *MachineName));
+
+	// Capture the prior entry target for the result (and the unchanged fast-path).
+	UAnimStateNodeBase* PrevTarget = GetEntryTargetState(EntryNode);
+	const FString PrevName = PrevTarget ? PrevTarget->GetStateName() : FString();
+
+	if (PrevTarget == TargetState)
+	{
+		TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("asset_path"), AssetPath);
+		Root->SetStringField(TEXT("machine_name"), MachineName);
+		Root->SetStringField(TEXT("previous_entry_state"), PrevName);
+		Root->SetStringField(TEXT("new_entry_state"), StateName);
+		Root->SetBoolField(TEXT("unchanged"), true);
+		Root->SetBoolField(TEXT("compile_ok"), true);
+		Root->SetBoolField(TEXT("saved"), false);
+		return FMonolithActionResult::Success(Root);
+	}
+
+	UEdGraphPin* EntryOut = EntryNode->GetOutputPin();
+	if (!EntryOut) return FMonolithActionResult::Error(TEXT("Entry node has no output pin"));
+	UEdGraphPin* StateIn = TargetState->GetInputPin();
+	if (!StateIn) return FMonolithActionResult::Error(FString::Printf(TEXT("Target state '%s' has no input pin"), *StateName));
+
+	const UAnimationStateMachineSchema* Schema = Cast<UAnimationStateMachineSchema>(SMGraph->GetSchema());
+	if (!Schema) return FMonolithActionResult::Error(TEXT("State machine graph has unexpected or null schema"));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Anim Entry State")));
+	SMGraph->Modify();
+
+	// Break the entry's current link(s), then connect to the new state's input pin. The entry node's
+	// output pin has no self-destruct behavior (unlike transition nodes), so breaking here is safe.
+	EntryOut->BreakAllPinLinks();
+	const bool bConnected = Schema->TryCreateConnection(EntryOut, StateIn);
+
+	GEditor->EndTransaction();
+
+	if (!bConnected)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to wire entry node to state '%s'"), *StateName));
+	}
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	const bool bCompileOk = (ABP->Status == EBlueprintStatus::BS_UpToDate
+		|| ABP->Status == EBlueprintStatus::BS_UpToDateWithWarnings);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	if (PrevName.IsEmpty())
+	{
+		Root->SetField(TEXT("previous_entry_state"), MakeShared<FJsonValueNull>());
+	}
+	else
+	{
+		Root->SetStringField(TEXT("previous_entry_state"), PrevName);
+	}
+	Root->SetStringField(TEXT("new_entry_state"), StateName);
+	Root->SetBoolField(TEXT("compile_ok"), bCompileOk);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRemoveAnimTransition(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor) return FMonolithActionResult::Error(TEXT("GEditor unavailable"));
+
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString FromState   = Params->GetStringField(TEXT("from_state"));
+	FString ToState     = Params->GetStringField(TEXT("to_state"));
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (FromState.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
+	if (ToState.IsEmpty())     return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateNode* FromNode = FindStateNodeByName(SMGraph, FromState);
+	if (!FromNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *FromState, *MachineName));
+
+	UAnimStateNode* ToNode = FindStateNodeByName(SMGraph, ToState);
+	if (!ToNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *ToState, *MachineName));
+
+	// Find the transition from FromState -> ToState. Use the source state's transition list and match
+	// the directed endpoints (GetPreviousState/GetNextState), mirroring the build_state_machine lookup.
+	TArray<UAnimStateTransitionNode*> Transitions;
+	FromNode->GetTransitionList(Transitions);
+
+	UAnimStateTransitionNode* TargetTransition = nullptr;
+	int32 MatchCount = 0;
+	for (UAnimStateTransitionNode* Trans : Transitions)
+	{
+		if (!Trans) continue;
+		UAnimStateNodeBase* Prev = Trans->GetPreviousState();
+		UAnimStateNodeBase* Next = Trans->GetNextState();
+		if (Prev && Next && Prev->GetStateName() == FromState && Next->GetStateName() == ToState)
+		{
+			if (!TargetTransition) TargetTransition = Trans;
+			++MatchCount;
+		}
+	}
+
+	if (!TargetTransition)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No transition '%s'->'%s' found in machine '%s'"), *FromState, *ToState, *MachineName));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Remove Anim Transition")));
+	SMGraph->Modify();
+
+	// Do NOT pre-break the transition's pin links — UAnimStateTransitionNode::PinConnectionListChanged
+	// self-destroys the node when links hit zero (AnimStateTransitionNode.cpp), invalidating the pointer.
+	// FBlueprintEditorUtils::RemoveNode breaks links + invokes DestroyNode (rule-subgraph teardown) itself.
+	FBlueprintEditorUtils::RemoveNode(ABP, TargetTransition, /*bDontRecompile=*/true);
+
+	GEditor->EndTransaction();
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	const bool bCompileOk = (ABP->Status == EBlueprintStatus::BS_UpToDate
+		|| ABP->Status == EBlueprintStatus::BS_UpToDateWithWarnings);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("from_state"), FromState);
+	Root->SetStringField(TEXT("to_state"), ToState);
+	Root->SetBoolField(TEXT("removed"), true);
+	Root->SetNumberField(TEXT("matched_transition_count"), MatchCount);
+	Root->SetBoolField(TEXT("compile_ok"), bCompileOk);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
 // Parsed representation of a structured transition rule. A plain-string `rule` collapses to
 // kind=bool (variable) or kind=auto, preserving full back-compat with the legacy string form.
 struct FParsedTransitionRule
@@ -7808,6 +8160,10 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchExecute(const TShare
 		else if (OpName == TEXT("delete_blendspace_sample"))  SubResult = HandleDeleteBlendSpaceSample(SubParams);
 		else if (OpName == TEXT("bake_blend_space"))          SubResult = HandleBakeBlendSpace(SubParams);
 		else if (OpName == TEXT("set_blend_space_interpolation")) SubResult = HandleSetBlendSpaceInterpolation(SubParams);
+		// State machine editing ops
+		else if (OpName == TEXT("remove_anim_state"))         SubResult = HandleRemoveAnimState(SubParams);
+		else if (OpName == TEXT("set_anim_entry_state"))      SubResult = HandleSetAnimEntryState(SubParams);
+		else if (OpName == TEXT("remove_anim_transition"))    SubResult = HandleRemoveAnimTransition(SubParams);
 		// Socket ops
 		else if (OpName == TEXT("add_socket"))                SubResult = HandleAddSocket(SubParams);
 		else if (OpName == TEXT("remove_socket"))             SubResult = HandleRemoveSocket(SubParams);
