@@ -2,7 +2,16 @@
 
 ## Current Configuration
 
-The Monolith MCP is configured to use the C++ proxy executable:
+On macOS/Linux, configure Monolith MCP through the shell launcher:
+
+```json
+{
+  "command": "<project-root>/Plugins/Monolith/Scripts/monolith_proxy.sh",
+  "args": []
+}
+```
+
+On Windows, configure the native C++ proxy executable:
 
 ```json
 {
@@ -15,14 +24,14 @@ This configuration is set in:
 - `.mcp.json` (project-level)
 - `~/.claude.json` (user-level)
 
-## Rollback to Python Proxy (if needed)
+## Python Proxy Direct Launch
 
-If the C++ proxy encounters issues, you can revert to the Python proxy by updating both config files to:
+If the shell launcher is not suitable, launch the Python proxy directly:
 
 ```json
 {
-  "command": "python",
-  "args": ["<project-root>/Scripts/monolith_proxy.py"]
+  "command": "python3",
+  "args": ["<project-root>/Plugins/Monolith/Scripts/monolith_proxy.py"]
 }
 ```
 
@@ -34,10 +43,10 @@ Then restart Claude Code.
 
 ## Proxy Details
 
-- **Python proxy:** `Scripts/monolith_proxy.py` — Stdio-to-HTTP proxy, survives editor restarts via background health polling
+- **Python proxy:** `Scripts/monolith_proxy.py` — Stdio-to-HTTP proxy, survives editor restarts via background health polling, and serves read-only offline `source`, `project`, `cppreflect`, `network`, `decision`, and `risk` queries from disk when the editor is down
 - **C++ proxy:** `Plugins/Monolith/Binaries/monolith_proxy.exe` — Native executable, faster startup
 - **Backend:** Both connect to the same Monolith HTTP server running in the Unreal Editor
-- **Editor-down startup:** Both proxies return a cached Monolith tool list when available, or a stable seed list of namespace/meta tools. This prevents MCP clients that do not fully refresh on `tools/list_changed` from starting with an empty Monolith catalog.
+- **Editor-down startup:** Proxies return a cached Monolith tool list when available, or a stable seed list of namespace/meta tools. The Python proxy also dispatches the offline-backed read-only namespaces through `Scripts/monolith_offline.py`, so useful source/project lookups still work before the editor starts.
 
 ## Call Log
 

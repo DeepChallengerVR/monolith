@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "monolith": {
-      "type": "http",
-      "url": "http://localhost:9316/mcp"
+      "command": "Plugins/monolith/Scripts/monolith_proxy.sh",
+      "args": []
     }
   }
 }

@@ -57,14 +57,14 @@ git clone https://github.com/tumourlove/monolith.git Monolith
 {
   "mcpServers": {
     "monolith": {
-      "command": "Plugins/Monolith/Binaries/monolith_proxy.exe",
+      "command": "Plugins/Monolith/Scripts/monolith_proxy.sh",
       "args": []
     }
   }
 }
 ```
 
-The native C++ proxy keeps your AI session alive when the editor restarts. For **Cursor/Cline**, **macOS/Linux**, or the **Python fallback**, see the [Installation wiki page](https://github.com/tumourlove/monolith/wiki/Installation).
+Use `Scripts/monolith_proxy.sh` on macOS/Linux and `Binaries/monolith_proxy.exe` or `Scripts/monolith_proxy.bat` on Windows. Match the `Plugins/Monolith` path casing to the folder name in your project. The proxy keeps your AI session alive when the editor restarts and serves the read-only offline namespaces (`source`, `project`, `cppreflect`, `network`, `decision`, `risk`) from disk while the editor is closed.
 
 **3. Open the editor.** Wait 30-60 seconds for the first-launch index. When you see `Monolith MCP server listening on port 9316` in the Output Log (filter `LogMonolith`), connect your AI client and ask *"what Monolith tools do you have?"* to verify.
 
@@ -74,10 +74,11 @@ Project-instructions files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) vary
 
 ## Standalone tools
 
-Two zero-dependency C++ executables ship in `Binaries/` and work without the editor:
+Standalone proxy/query tools work without the editor:
 
 - **`monolith_proxy.exe`** — MCP stdio↔HTTP proxy. Keeps your AI session alive across editor restarts. Used by the `.mcp.json` config above.
 - **`monolith_query.exe`** — Offline query tool. Serves the engine source index, project asset index, and the full Reflection Intelligence surface (`decision` / `risk` / `cppreflect` / `network`) without launching UE — byte-identical to the live server, verified by a ship-blocking parity guard. Instant startup; useful for terminal-side lookups and CI when the editor is down.
+- **`Scripts/monolith_proxy.sh` + `Scripts/monolith_offline.py`** — macOS/Linux fallback path with no compiled proxy dependency. The MCP proxy forwards to the editor when it is up and falls back to offline read-only queries when it is down.
 
 Details: [wiki Tool Reference](https://github.com/tumourlove/monolith/wiki/Tool-Reference).
 

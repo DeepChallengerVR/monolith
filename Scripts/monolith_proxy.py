@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -70,7 +71,88 @@ CORE_QUERY_TOOLS = [
     "logicdriver_query",
     "audio_query",
     "level_sequence_query",
+    "decision_query",
+    "risk_query",
+    "cppreflect_query",
+    "network_query",
+    "pipeline_query",
+    "reflect_query",
 ]
+
+OFFLINE_QUERY_TO_NAMESPACE = {
+    "source_query": "source",
+    "project_query": "project",
+    "cppreflect_query": "cppreflect",
+    "network_query": "network",
+    "decision_query": "decision",
+    "risk_query": "risk",
+}
+
+OFFLINE_ACTIONS = {
+    "source": {
+        "search_source": ["query"],
+        "read_source": ["symbol"],
+        "find_references": ["symbol"],
+        "find_callers": ["symbol"],
+        "find_callees": ["symbol"],
+        "get_class_hierarchy": ["symbol"],
+        "get_module_info": ["module_name"],
+        "get_symbol_context": ["symbol"],
+        "read_file": ["file_path"],
+        "get_include_path": ["symbol"],
+        "get_signature": ["symbol"],
+        "check_deprecations": ["symbols"],
+        "verify_symbols": ["symbols"],
+        "find_example_usage": ["symbol"],
+        "lint_header": ["file_path"],
+        "generate_class_stub": ["parent", "class_name", "module"],
+    },
+    "project": {
+        "search": ["query"],
+        "find_by_type": ["asset_class"],
+        "find_references": ["asset_path"],
+        "get_stats": [],
+        "get_asset_details": ["asset_path"],
+    },
+    "cppreflect": {
+        "get_uclass": ["class_name"],
+        "list_uproperties": ["class_name?"],
+        "list_ufunctions": ["class_name?"],
+        "find_interface_impls": ["interface_name"],
+        "find_class_specifier": ["specifier_name"],
+        "list_class_specifiers": [],
+    },
+    "network": {
+        "list_replicated_classes": [],
+        "list_rpc_functions": [],
+        "list_onrep_handlers": [],
+        "audit_unbalanced_onreps": [],
+    },
+    "decision": {
+        "list_decisions": [],
+        "get_decision": ["decision_id"],
+        "list_stale": ["max_age_days?"],
+        "find_supersession_chain": ["decision_id"],
+        "find_referent_decisions": ["decision_id"],
+    },
+    "risk": {
+        "get_hotspot_score": ["file_path"],
+        "get_cochange_pairs": ["file_path"],
+        "get_file_churn": ["file_path"],
+        "get_release_window_hotspots": [],
+        "list_conditional_gates": [],
+    },
+}
+
+OFFLINE_NAMESPACE_ORDER = ["source", "project", "cppreflect", "network", "decision", "risk"]
+OFFLINE_GUIDE_SECTIONS = ["onboarding", "recipes", "decisions", "errors", "skills_map", "gotchas"]
+SHAPING_KEYS = {"_fields", "_omit", "_compact_json"}
+
+CLI_FLAG_NAMES = {
+    "max_lines": "--max-lines",
+    "ref_kind": "--ref-kind",
+    "context_lines": "--context-lines",
+}
 
 
 def _log(msg: str) -> None:
@@ -272,6 +354,17 @@ def _tool_error(id, message: str) -> str:
     })
 
 
+def _tool_text(id, text: str, is_error: bool = False) -> str:
+    return json.dumps({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error,
+        },
+    })
+
+
 def _jsonrpc_error(id, code: int, message: str) -> str:
     """Return a JSON-RPC protocol-level error."""
     return json.dumps({
@@ -352,13 +445,396 @@ def _make_tool(name: str, description: str, schema: dict) -> dict:
     return {"name": name, "description": description, "inputSchema": schema}
 
 
+def _plugin_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _project_root() -> Path:
+    return Path(os.environ.get("MONOLITH_PROJECT_ROOT") or os.getcwd()).resolve()
+
+
+def _offline_script_path() -> Path:
+    return Path(__file__).resolve().with_name("monolith_offline.py")
+
+
+def _offline_source_db_path() -> Path:
+    return _plugin_root() / "Saved" / "EngineSource.db"
+
+
+def _offline_project_db_path() -> Path:
+    return _plugin_root() / "Saved" / "ProjectIndex.db"
+
+
+def _format_json_payload(payload: dict) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _offline_action_schema(namespace: str, action: str) -> dict:
+    specs = OFFLINE_ACTIONS.get(namespace, {}).get(action, [])
+    required = [s for s in specs if not s.endswith("?")]
+    properties = {
+        spec.rstrip("?"): {
+            "description": "Forwarded to monolith_offline.py.",
+        }
+        for spec in specs
+    }
+    properties.update({
+        "_fields": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional top-level whitelist for JSON responses.",
+        },
+        "_omit": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional top-level blacklist for JSON responses.",
+        },
+        "_compact_json": {
+            "type": "boolean",
+            "description": "Drop empty top-level JSON fields when true.",
+        },
+    })
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "offline": True,
+    }
+
+
+def _offline_discover_payload(namespace: str | None = None) -> dict:
+    dbs = {
+        "source": str(_offline_source_db_path()),
+        "project": str(_offline_project_db_path()),
+    }
+
+    if namespace:
+        if namespace == "monolith":
+            return {
+                "success": True,
+                "offline": True,
+                "editor_online": False,
+                "namespace": "monolith",
+                "actions": [
+                    {"name": "discover", "description": "Offline namespace/action inventory."},
+                    {"name": "status", "description": "Proxy and offline database status."},
+                    {"name": "guide", "description": "Read Docs/MONOLITH_GUIDE.md from disk."},
+                ],
+            }
+        actions = OFFLINE_ACTIONS.get(namespace)
+        if actions is None:
+            return {
+                "success": False,
+                "offline": True,
+                "editor_online": False,
+                "error": (
+                    f"Namespace '{namespace}' is not available while the Unreal Editor is offline. "
+                    f"Offline namespaces: {', '.join(OFFLINE_NAMESPACE_ORDER)}."
+                ),
+            }
+        return {
+            "success": True,
+            "offline": True,
+            "editor_online": False,
+            "namespace": namespace,
+            "action_count": len(actions),
+            "actions": [
+                {
+                    "name": action,
+                    "params": _offline_action_schema(namespace, action),
+                    "readOnlyHint": True,
+                    "idempotentHint": True,
+                }
+                for action in actions
+            ],
+            "database_paths": dbs,
+        }
+
+    return {
+        "success": True,
+        "offline": True,
+        "editor_online": False,
+        "proxy": {"name": PROXY_NAME, "version": PROXY_VERSION},
+        "offline_namespaces": [
+            {
+                "namespace": ns,
+                "action_count": len(OFFLINE_ACTIONS[ns]),
+                "actions": list(OFFLINE_ACTIONS[ns].keys()),
+            }
+            for ns in OFFLINE_NAMESPACE_ORDER
+        ],
+        "offline_meta_tools": ["monolith_discover", "monolith_status", "monolith_guide"],
+        "database_paths": dbs,
+        "guide_hint": "Call monolith_guide(section='recipes') for workflows. Write/edit actions require the Unreal Editor.",
+    }
+
+
+def _offline_status_payload() -> dict:
+    return {
+        "success": True,
+        "proxy": {"name": PROXY_NAME, "version": PROXY_VERSION},
+        "editor_online": _check_monolith_up(),
+        "monolith_url": MONOLITH_URL,
+        "offline_enabled": os.environ.get("MONOLITH_OFFLINE", "1") != "0",
+        "offline_script": str(_offline_script_path()),
+        "offline_namespaces": OFFLINE_NAMESPACE_ORDER,
+        "database_paths": {
+            "source": {
+                "path": str(_offline_source_db_path()),
+                "exists": _offline_source_db_path().exists(),
+            },
+            "project": {
+                "path": str(_offline_project_db_path()),
+                "exists": _offline_project_db_path().exists(),
+            },
+        },
+    }
+
+
+def _read_guide_section(section: str | None) -> tuple[bool, str]:
+    guide_path = _plugin_root() / "Docs" / "MONOLITH_GUIDE.md"
+    try:
+        text = guide_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return False, f"Guide markdown not found or unreadable at {guide_path}: {e}"
+
+    if not section:
+        return True, text
+
+    if section not in OFFLINE_GUIDE_SECTIONS:
+        return False, (
+            f"Unknown guide section '{section}'. "
+            f"Valid sections: {', '.join(OFFLINE_GUIDE_SECTIONS)}."
+        )
+
+    header = f"## {section}"
+    start = text.find(header)
+    if start < 0:
+        return False, f"Guide section '{section}' was not found in {guide_path}."
+
+    next_start = text.find("\n## ", start + len(header))
+    if next_start < 0:
+        return True, text[start:].strip()
+    return True, text[start:next_start].strip()
+
+
+def _extract_tool_arguments(msg: dict) -> dict:
+    params = msg.get("params") or {}
+    if not isinstance(params, dict):
+        return {}
+    args = params.get("arguments") or {}
+    return args if isinstance(args, dict) else {}
+
+
+def _extract_query_params(args: dict) -> tuple[str, dict, dict]:
+    action = str(args.get("action") or "").strip()
+    nested = args.get("params")
+    if isinstance(nested, dict):
+        query_params = dict(nested)
+    else:
+        query_params = {
+            k: v
+            for k, v in args.items()
+            if k not in {"action", "params"} and k not in SHAPING_KEYS
+        }
+    shaping = {k: args.get(k) for k in SHAPING_KEYS if k in args}
+    for key in SHAPING_KEYS:
+        if key in query_params and key not in shaping:
+            shaping[key] = query_params.pop(key)
+    return action, query_params, shaping
+
+
+def _flag_name(key: str) -> str:
+    return CLI_FLAG_NAMES.get(key, "--" + key)
+
+
+def _append_cli_value(argv: list[str], value) -> None:
+    if isinstance(value, (list, tuple)):
+        argv.extend(str(v) for v in value)
+    else:
+        argv.append(str(value))
+
+
+def _build_offline_argv(namespace: str, action: str, params: dict) -> tuple[list[str] | None, str | None]:
+    actions = OFFLINE_ACTIONS.get(namespace, {})
+    specs = actions.get(action)
+    if specs is None:
+        return None, (
+            f"Action '{namespace}.{action}' is not available while the Unreal Editor is offline. "
+            f"Offline actions for {namespace}: {', '.join(actions.keys())}."
+        )
+
+    argv = [sys.executable or "python3", str(_offline_script_path()), namespace, action]
+    remaining = dict(params)
+
+    for raw_spec in specs:
+        optional = raw_spec.endswith("?")
+        name = raw_spec.rstrip("?")
+        value = remaining.pop(name, None)
+        if value is None and name == "module_name":
+            value = remaining.pop("module", None)
+            if value is None:
+                value = remaining.pop("symbol", None)
+        if value is None and name == "class_name":
+            value = remaining.pop("class_name_pos", None)
+        if value is None or value == "":
+            if optional:
+                continue
+            return None, f"Offline action '{namespace}.{action}' requires parameter '{name}'."
+        _append_cli_value(argv, value)
+
+    for key in list(remaining.keys()):
+        if key in SHAPING_KEYS:
+            remaining.pop(key, None)
+
+    for key, value in remaining.items():
+        if value is None or value == "":
+            continue
+
+        if isinstance(value, bool):
+            if key == "header":
+                if not value:
+                    argv.append("--no-header")
+            elif value:
+                argv.append(_flag_name(key))
+            continue
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                argv.extend([_flag_name(key), str(item)])
+            continue
+
+        argv.extend([_flag_name(key), str(value)])
+
+    return argv, None
+
+
+def _apply_response_shaping(text: str, shaping: dict) -> str:
+    if not shaping:
+        return text
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return text
+    if not isinstance(payload, dict):
+        return text
+
+    fields = shaping.get("_fields")
+    omit = shaping.get("_omit")
+    if isinstance(fields, list) and isinstance(omit, list):
+        payload = {
+            "success": False,
+            "error": "_fields and _omit are mutually exclusive.",
+        }
+    elif isinstance(fields, list):
+        payload = {k: payload[k] for k in fields if isinstance(k, str) and k in payload}
+    elif isinstance(omit, list):
+        for k in omit:
+            if isinstance(k, str):
+                payload.pop(k, None)
+
+    if shaping.get("_compact_json") is True:
+        payload = {
+            k: v for k, v in payload.items()
+            if v is not None and v != "" and v != [] and v != {}
+        }
+
+    return _format_json_payload(payload)
+
+
+def _try_offline_query(msg: dict, tool_name: str) -> str | None:
+    if os.environ.get("MONOLITH_OFFLINE", "1") == "0":
+        return None
+
+    namespace = OFFLINE_QUERY_TO_NAMESPACE.get(tool_name)
+    if not namespace:
+        return None
+
+    args = _extract_tool_arguments(msg)
+    action, query_params, shaping = _extract_query_params(args)
+    if not action:
+        return _tool_error(msg.get("id"), f"Tool '{tool_name}' requires an 'action' string argument.")
+
+    argv, error = _build_offline_argv(namespace, action, query_params)
+    if error:
+        return _tool_error(msg.get("id"), error)
+
+    if not _offline_script_path().exists():
+        return _tool_error(msg.get("id"), f"Offline script not found: {_offline_script_path()}")
+
+    timeout = float(os.environ.get("MONOLITH_OFFLINE_TIMEOUT", "30"))
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(_project_root()),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return _tool_error(
+            msg.get("id"),
+            f"Offline action '{namespace}.{action}' timed out after {timeout:g}s.",
+        )
+    except OSError as e:
+        return _tool_error(msg.get("id"), f"Failed to run offline action '{namespace}.{action}': {e}")
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    ok = proc.returncode == 0
+    text = stdout if stdout else stderr
+    if not text:
+        text = f"Offline action '{namespace}.{action}' exited with code {proc.returncode}."
+    elif stderr and not ok:
+        text = f"{text}\n\nstderr:\n{stderr}" if stdout else stderr
+
+    if ok:
+        text = _apply_response_shaping(text, shaping)
+
+    return _tool_text(msg.get("id"), text, is_error=not ok)
+
+
+def _try_offline_meta_tool(msg: dict, tool_name: str) -> str | None:
+    if os.environ.get("MONOLITH_OFFLINE", "1") == "0":
+        return None
+
+    args = _extract_tool_arguments(msg)
+    if tool_name == "monolith_discover":
+        namespace = args.get("namespace")
+        if namespace is not None:
+            namespace = str(namespace).strip() or None
+        payload = _offline_discover_payload(namespace)
+        return _tool_text(msg.get("id"), _format_json_payload(payload), not payload.get("success", False))
+
+    if tool_name == "monolith_status":
+        return _tool_text(msg.get("id"), _format_json_payload(_offline_status_payload()))
+
+    if tool_name == "monolith_guide":
+        section = args.get("section")
+        ok, text = _read_guide_section(str(section).strip() if section else None)
+        return _tool_text(msg.get("id"), text, is_error=not ok)
+
+    return None
+
+
 def _seed_tools() -> list[dict]:
     tools = []
     for name in CORE_QUERY_TOOLS:
         domain = name[:-6] if name.endswith("_query") else name
+        offline_note = (
+            " Offline-backed while the editor is closed."
+            if name in OFFLINE_QUERY_TO_NAMESPACE
+            else " Requires a running Unreal Editor."
+        )
         tools.append(_make_tool(
             name,
-            f"Query the {domain} domain. The editor may be offline at session start; retry after Monolith is healthy.",
+            f"Query the {domain} domain.{offline_note}",
             _query_tool_schema(),
         ))
 
@@ -389,8 +865,35 @@ def _seed_tools() -> list[dict]:
     ))
     tools.append(_make_tool(
         "monolith_status",
-        "Get Monolith server health: version, uptime, port, registered action count, and module status.",
+        "Get Monolith server health when the editor is online; reports proxy/offline status when it is not.",
         _empty_object_schema(),
+    ))
+    tools.append(_make_tool(
+        "monolith_guide",
+        "Read the Monolith editorial guide. This is available from disk while the editor is offline.",
+        {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "description": "Optional section key: onboarding, recipes, decisions, errors, skills_map, gotchas",
+                },
+                "_fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Accepted for schema consistency; ignored for markdown guide text.",
+                },
+                "_omit": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Accepted for schema consistency; ignored for markdown guide text.",
+                },
+                "_compact_json": {
+                    "type": "boolean",
+                    "description": "Accepted for schema consistency; ignored for markdown guide text.",
+                },
+            },
+        },
     ))
     tools.append(_make_tool(
         "monolith_update",
@@ -451,11 +954,26 @@ def _read_tools_cache() -> list[dict] | None:
     return None
 
 
+def _merge_seed_tools(tools: list[dict]) -> list[dict]:
+    merged = list(tools)
+    seen = {
+        t.get("name")
+        for t in merged
+        if isinstance(t, dict) and isinstance(t.get("name"), str)
+    }
+    for seed in _seed_tools():
+        name = seed.get("name")
+        if name not in seen:
+            merged.append(seed)
+            seen.add(name)
+    return merged
+
+
 def _fallback_tools_list(msg: dict) -> str:
     cached = _read_tools_cache()
     if cached:
-        _log("Monolith down during tools/list — returning cached tools")
-        return _result(msg.get("id"), {"tools": cached})
+        _log("Monolith down during tools/list — returning cached tools plus offline seed tools")
+        return _result(msg.get("id"), {"tools": _merge_seed_tools(cached)})
 
     _log("Monolith down during tools/list — returning seed tools")
     return _result(msg.get("id"), {"tools": _seed_tools()})
@@ -527,12 +1045,14 @@ def handle_initialize(msg: dict) -> str:
         "serverInfo": {"name": PROXY_NAME, "version": PROXY_VERSION},
         "instructions": (
             "Monolith MCP proxy for Unreal Engine. Tools are forwarded to the Unreal Editor. "
+            "When the editor is closed, read-only offline tools remain available for source, "
+            "project, cppreflect, network, decision, and risk queries against the on-disk SQLite indexes. "
             "Before calling a domain action, check its schema instead of guessing: "
             "monolith_discover() lists namespaces, monolith_discover('<namespace>') lists a "
             "namespace's actions, and describe_query('action_schema', ...) returns an action's "
             "exact parameter schema. monolith_guide(section='recipes') gives cross-namespace "
             "workflows, decision matrices, and gotchas. "
-            "If tools return errors about the editor not running, wait and retry."
+            "If a live-only tool returns an editor-not-running error, start the editor and retry."
         ),
     })
 
@@ -556,6 +1076,7 @@ def handle_tools_list(msg: dict) -> str:
 
 def handle_tools_call(msg: dict) -> str:
     """Forward tools/call to Monolith. Graceful error if down."""
+    tool_name = msg.get("params", {}).get("name", "unknown")
     t0 = time.perf_counter()
     resp = _post_monolith(json.dumps(msg))
     duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -563,11 +1084,20 @@ def handle_tools_call(msg: dict) -> str:
 
     if resp:
         return resp
-    tool_name = msg.get("params", {}).get("name", "unknown")
+
+    offline_resp = _try_offline_meta_tool(msg, tool_name)
+    if offline_resp:
+        return offline_resp
+
+    offline_resp = _try_offline_query(msg, tool_name)
+    if offline_resp:
+        return offline_resp
+
     return _tool_error(
         msg.get("id"),
         f"Monolith MCP is not available (Unreal Editor not running). "
-        f"Tool '{tool_name}' cannot execute. Start the editor and try again.",
+        f"Tool '{tool_name}' is live-only. Start the editor and try again, or use one of the "
+        f"offline namespaces: {', '.join(OFFLINE_NAMESPACE_ORDER)}.",
     )
 
 

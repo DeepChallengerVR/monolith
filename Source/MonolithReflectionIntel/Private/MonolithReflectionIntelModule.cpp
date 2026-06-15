@@ -36,6 +36,7 @@
 #include "MonolithReflectionIntelSettings.h"
 
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
@@ -518,10 +519,15 @@ TArray<FString> FMonolithReflectionIntelModule::ResolveArtefactRoots(
 {
 	TArray<FString> Roots;
 
-	// Game module root — ALWAYS scanned (preserves the original single-root
-	// behavior). FUHTArtefactReader / FNetworkRepIndexer descend
-	// <root>/<Platform>/<Target>/Inc/<Module>/UHT/ from here.
-	Roots.Add(FPaths::ProjectIntermediateDir() / TEXT("Build"));
+	const FString HostPlatform = FPlatformProcess::GetBinariesSubdirectory();
+
+	// Game module root — ALWAYS scanned. Keep this absolute and editor-targeted:
+	// FPaths::ProjectIntermediateDir() may be relative on macOS, and handing that
+	// to the readers makes their project-relative rebase produce /../../...
+	// paths. Pinning to the current host platform also avoids cross-platform /
+	// non-editor generated artefacts double-counting the same reflected surface.
+	Roots.Add(FPaths::ConvertRelativePathToFull(
+		FPaths::ProjectDir() / TEXT("Intermediate") / TEXT("Build") / HostPlatform / TEXT("UnrealEditor")));
 
 	// Fold in enabled plugins per the two scope flags. GetEnabledPlugins()
 	// returns enabled-only, so disabled plugins are never considered.
@@ -541,12 +547,13 @@ TArray<FString> FMonolithReflectionIntelModule::ResolveArtefactRoots(
 		// absolute base dir, so this wrap is a harmless no-op for them.
 		const FString PluginBaseAbs = FPaths::ConvertRelativePathToFull(Plugin->GetBaseDir());
 
-		// PIN Win64/UnrealEditor: scanning the plugin's whole Build dir would
-		// multi-count the same UObjects across Android/IOS/Mac/UnrealGame
-		// variant trees. We only want the editor target's artefacts.
+		// Pin the current host platform's UnrealEditor target. Scanning the
+		// plugin's whole Build dir would multi-count the same UObjects across
+		// Android/IOS/Mac/UnrealGame variant trees, and hardcoding Win64 breaks
+		// macOS editor sessions.
 		const FString PluginRoot =
 			PluginBaseAbs
-			/ TEXT("Intermediate") / TEXT("Build") / TEXT("Win64") / TEXT("UnrealEditor");
+			/ TEXT("Intermediate") / TEXT("Build") / HostPlatform / TEXT("UnrealEditor");
 
 		const EPluginLoadedFrom LoadedFrom = Plugin->GetLoadedFrom();
 
